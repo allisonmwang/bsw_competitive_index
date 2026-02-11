@@ -107,12 +107,13 @@ To force a fresh run:
 - delete the cache file, or set `--cache_ttl_days 0`.
 
 ### 2) Prefilter gate (reduces web_search calls)
-The script uses a lightweight heuristic prefilter **before** OpenAI enrichment.
+The script uses a lightweight heuristic prefilter **before** OpenAI enrichment. It scores each place from name, website, address, and place types (no API calls). Only places with score below the threshold are skipped; when in doubt they are sent to OpenAI to avoid false negatives.
 
 - Default: enabled with `--prefilter_min_score 2`
 - Disable: `--disable_prefilter` (higher cost, potentially higher recall)
+- **Company-name cache:** Prefilter results are cached by normalized company name in `--prefilter_cache_path` (default `prefilter_cache.json`). The same business name reuses the cached score across runs and across different `place_id`s, so you avoid recomputing the heuristic and get consistent skip/don’t-skip decisions.
 
-Prefilter audit columns appear in `competitors_enriched.csv`:
+Prefilter audit columns in `competitors_enriched.csv`:
 - `prefilter_score`
 - `prefilter_reasons`
 - `prefilter_skipped`

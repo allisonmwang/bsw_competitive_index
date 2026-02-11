@@ -8,7 +8,7 @@ Goal
 For each BrandSafway branch (lat/lon), identify nearby competitor locations within a
 specified radius (default: 30 miles) using Google Places API, then enrich each
 competitor with:
-  - Company size bucket (Small 0–49, Mid 50–249, Large 250+ employees; Unknown when evidence is thin)
+  - Company size bucket (Small 0–49, Medium 50–249, Large 250+ employees; Unknown when evidence is thin)
   - Estimated employee range (if available)
   - Service offerings relevant to BrandSafway (scaffolding, forming/shoring,
     insulation, painting, motorized, specialty)
@@ -164,6 +164,14 @@ BLOCK_TYPES = {
     "mosque",
     "synagogue",
     "funeral_home",
+    "plumber",
+    "electrician",
+    "hvac",
+    "roofing_contractor",
+    "flooring",
+    "moving_company",
+    "landscaping",
+    "real_estate_agency",
 }
 
 EXCLUDE_NAME_SUBSTRINGS = {
@@ -200,8 +208,8 @@ SERVICE_KEYS = [
     "specialty",
 ]
 
-# Size buckets: Small 0-49, Mid 50-249, Large 250+ employees; Unknown when evidence is thin.
-SIZE_BUCKETS = ["Small", "Mid", "Large", "Unknown"]
+# Size buckets: Small 0-49, Medium 50-249, Large 250+ employees; Unknown when evidence is thin.
+SIZE_BUCKETS = ["Small", "Medium", "Large", "Unknown"]
 MIN_SERVICE_CONFIDENCE = 0.7  # Service "match" only when confidence >= this.
 
 
@@ -683,7 +691,7 @@ class OpenAIEnricher:
             "   - painting: industrial coatings/blasting/fireproofing; painting_evidence e.g. 'protective coatings, sandblasting, fireproofing'\n"
             "   - motorized: MCWP, mast climbers, suspended platforms; motorized_evidence e.g. 'mast climber, swing stage, BMU'\n"
             "   - specialty: refractory, heat tracing, cathodic protection, UL firestopping, leak sealing, abatement; specialty_evidence with keywords\n"
-            "3) Size bucket: Small (0–49), Mid (50–249), Large (250+), or Unknown. size_confidence (0–1), size_evidence (brief). employee_estimate: free-text range when known.\n"
+            "3) Size bucket: Small (0–49), Medium (50–249), Large (250+), or Unknown. size_confidence (0–1), size_evidence (brief). employee_estimate: free-text range when known.\n"
             "4) citations: List ALL web-searched URLs or source references used (semicolon-separated) for full traceability.\n\n"
             "Guardrails: No decorative/residential-only; Forming & Shoring only for heavy civil/nuclear; Specialty only for industrial/regulated. Confidence >= 0.7 = solid match."
         )
@@ -726,7 +734,7 @@ class OpenAIEnricher:
         prompt = (
             "You will be given a JSON list of companies. For EACH company, use web search to determine:\n"
             "(a) is_competitor: whether it competes with BrandSafway.\n"
-            "(b) Size bucket: Small (0–49), Mid (50–249), Large (250+), or Unknown. size_confidence (0–1), size_evidence (brief). employee_estimate: free-text range when known.\n"
+            "(b) Size bucket: Small (0–49), Medium (50–249), Large (250+), or Unknown. size_confidence (0–1), size_evidence (brief). employee_estimate: free-text range when known.\n"
             "(c) For each service (scaffolding, forming_shoring, insulation, painting, motorized, specialty): set the boolean, _confidence (0–1), and _evidence (short text with helpful keywords, e.g. 'containment, tube-and-clamp' for scaffolding). Only confidence >= 0.7 counts as a solid match.\n"
             "(d) citations: List ALL web-searched URLs/sources used for this company (semicolon-separated) for traceability.\n"
             "Return one object per input company with the same place_id. Populate top_sources with up to 3 URLs and citations with all sources used.\n\n"
@@ -805,11 +813,54 @@ def is_blocked(place: Dict[str, Any]) -> bool:
 # prefilter reduces cost by skipping enrichment for low-signal candidates.
 #
 # Design goals:
-# - Conservative: avoid filtering out true competitors.
+# - Conservative: avoid filtering out true competitors (when in doubt, do not skip).
 # - Explainable: produce a simple score + reasons for auditing.
 # - Cheap: pure string/type heuristics (no external calls).
+# - Company-name cache: reuse prefilter outcome by normalized company name across runs.
 
 DEFAULT_PREFILTER_MIN_SCORE = 2
+
+
+def normalize_company_name(company_name: str) -> str:
+    """Normalize company name for cache key: lowercased, stripped, single spaces."""
+    return " ".join((company_name or "").strip().lower().split())
+
+
+class PrefilterCache:
+    """Persistent cache of prefilter results keyed by normalized company name."""
+
+    def __init__(self, path: Path):
+        self._path = path
+        self._lock = threading.Lock()
+        self._data: Dict[str, Dict[str, Any]] = {}
+        self._dirty = False
+        self._load()
+
+    def _load(self) -> None:
+        if not self._path.exists():
+            return
+        try:
+            self._data = json.loads(self._path.read_text(encoding="utf-8"))
+        except Exception:
+            logging.warning("Failed to read prefilter cache; starting empty: %s", self._path)
+            self._data = {}
+
+    def get(self, normalized_name: str) -> Optional[Dict[str, Any]]:
+        """Return cached {score, reasons} or None."""
+        with self._lock:
+            return self._data.get(normalized_name)
+
+    def set(self, normalized_name: str, score: int, reasons: str) -> None:
+        with self._lock:
+            self._data[normalized_name] = {"score": score, "reasons": reasons}
+            self._dirty = True
+
+    def save(self) -> None:
+        with self._lock:
+            if not self._dirty:
+                return
+            safe_json_dump(self._path, self._data)
+            self._dirty = False
 
 # Strong service hints that frequently indicate BrandSafway-like competitors.
 PREFILTER_STRONG_TERMS = {
@@ -1260,6 +1311,7 @@ def parse_args() -> argparse.Namespace:
     # Prefilter (cost-control). Disable to maximize recall at higher cost.
     p.add_argument("--disable_prefilter", action="store_true", help="Disable heuristic prefilter (higher cost, potentially higher recall)")
     p.add_argument("--prefilter_min_score", type=int, default=DEFAULT_PREFILTER_MIN_SCORE, help="Minimum prefilter score to run OpenAI enrichment when not cached")
+    p.add_argument("--prefilter_cache_path", default="prefilter_cache.json", help="Path to persistent prefilter cache (keyed by normalized company name)")
 
     # Concurrency controls
     p.add_argument("--branch_workers", type=int, default=8, help="Parallelism for branch discovery")
@@ -1395,7 +1447,8 @@ def main() -> None:
     logging.info("Unique places to enrich (before cache): %s", len(place_list))
 
     # Prefilter gate (cost control): only run OpenAI enrichment on places with
-    # sufficient signal, unless already cached.
+    # sufficient signal, unless already enrichment-cached. Uses company-name cache.
+    prefilter_cache = PrefilterCache(Path(getattr(args, "prefilter_cache_path", "prefilter_cache.json")))
     prefilter_meta: Dict[str, Dict[str, Any]] = {}
     prefilter_skipped: set = set()
     enrich_pool: List[Dict[str, Any]] = []
@@ -1405,8 +1458,8 @@ def main() -> None:
 
     for p in place_list:
         pid = p["place_id"]
-        cached = enricher.get_cached(pid)
-        if cached is not None:
+        enrichment_cached = enricher.get_cached(pid)
+        if enrichment_cached is not None:
             enrich_pool.append(p)
             continue
 
@@ -1414,10 +1467,19 @@ def main() -> None:
             enrich_pool.append(p)
             continue
 
-        score, reasons = prefilter_score(p)
+        normalized_name = normalize_company_name(p.get("company_name") or "")
+        cached_result = prefilter_cache.get(normalized_name)
+        if cached_result is not None:
+            score = int(cached_result.get("score", 0))
+            reasons_str = cached_result.get("reasons", "no_signals")
+            reasons = reasons_str.split(";") if isinstance(reasons_str, str) else list(reasons_str)
+        else:
+            score, reasons = prefilter_score(p)
+            prefilter_cache.set(normalized_name, score, ";".join(reasons))
+
         prefilter_meta[pid] = {
             "prefilter_score": score,
-            "prefilter_reasons": ";".join(reasons),
+            "prefilter_reasons": ";".join(reasons) if isinstance(reasons, list) else str(reasons),
             "prefilter_skipped": score < min_score,
         }
         if score >= min_score:
@@ -1530,6 +1592,7 @@ def main() -> None:
 
     # Final cache save (safe)
     cache.save()
+    prefilter_cache.save()
 
 
 if __name__ == "__main__":

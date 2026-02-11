@@ -1,0 +1,302 @@
+{
+  "aluma systems": {
+    "score": 0,
+    "reasons": "no_signals"
+  },
+  "alliance refractories bc": {
+    "score": 2,
+    "reasons": "context=contractor;types=general_contractor"
+  },
+  "allredi": {
+    "score": 0,
+    "reasons": "no_signals"
+  },
+  "tricities scaffolding": {
+    "score": 6,
+    "reasons": "strong=scaffold,scaffolding"
+  },
+  "integral building maintenance inc.": {
+    "score": 0,
+    "reasons": "no_signals"
+  },
+  "matcon": {
+    "score": 2,
+    "reasons": "context=contractor;types=general_contractor"
+  },
+  "icc marine services": {
+    "score": 3,
+    "reasons": "context=services,contractor;types=general_contractor"
+  },
+  "executive building maintenance": {
+    "score": 0,
+    "reasons": "no_signals"
+  },
+  "nelson's mechanical insulation services ltd": {
+    "score": 6,
+    "reasons": "strong=insulation;context=services,contractor;types=general_contractor"
+  },
+  "pacific building maintenance solutions": {
+    "score": 0,
+    "reasons": "no_signals"
+  },
+  "crossroads c & i distributors": {
+    "score": 2,
+    "reasons": "context=contractor;types=general_contractor"
+  },
+  "ikea coquitlam": {
+    "score": 0,
+    "reasons": "no_signals"
+  },
+  "atlas scaffolding ltd.": {
+    "score": 6,
+    "reasons": "strong=scaffold,scaffolding"
+  },
+  "m&j caulking ltd": {
+    "score": 2,
+    "reasons": "context=contractor;types=general_contractor"
+  },
+  "sierra drilling & blasting ltd": {
+    "score": 2,
+    "reasons": "context=contractor;types=general_contractor"
+  },
+  "northstar access": {
+    "score": 6,
+    "reasons": "strong=scaffold,scaffolding"
+  },
+  "ener-spray pacific": {
+    "score": 2,
+    "reasons": "context=contractor;types=general_contractor"
+  },
+  "tri-city sandblasting ltd.": {
+    "score": 3,
+    "reasons": "strong=sandblasting"
+  },
+  "vicious coatings ltd": {
+    "score": 6,
+    "reasons": "strong=coating,coatings"
+  },
+  "elevations scaffold ltd.": {
+    "score": 3,
+    "reasons": "strong=scaffold"
+  },
+  "ghotra excavating & trucking ltd.": {
+    "score": 2,
+    "reasons": "context=contractor;types=general_contractor"
+  },
+  "joecorp solutions ltd": {
+    "score": 1,
+    "reasons": "context=industrial"
+  },
+  "d & s bulldozing ltd": {
+    "score": 2,
+    "reasons": "context=contractor;types=general_contractor"
+  },
+  "cobal industries ltd - demolition services & heavy equipment repair": {
+    "score": 3,
+    "reasons": "context=services,equipment;types=general_contractor"
+  },
+  "charcoat passive fire protection inc.": {
+    "score": 0,
+    "reasons": "no_signals"
+  },
+  "united scaffold supply company": {
+    "score": 3,
+    "reasons": "strong=scaffold"
+  },
+  "surf-tech industries": {
+    "score": 6,
+    "reasons": "strong=coating,coatings"
+  },
+  "kandovan construction": {
+    "score": 3,
+    "reasons": "context=construction,contractor;types=general_contractor"
+  },
+  "ttf scaffolding inc.": {
+    "score": 6,
+    "reasons": "strong=scaffold,scaffolding"
+  },
+  "canadian pressure welding contracting ltd - cpw contracting": {
+    "score": 3,
+    "reasons": "strong=cp"
+  },
+  "aurum finish ltd": {
+    "score": 0,
+    "reasons": "no_signals"
+  },
+  "ironhorse shoring & deep foundations": {
+    "score": 3,
+    "reasons": "strong=shoring"
+  },
+  "canadian floor coatings": {
+    "score": 8,
+    "reasons": "strong=coating,coatings;context=contractor;types=general_contractor"
+  },
+  "westcan scaffolding inc.": {
+    "score": 6,
+    "reasons": "strong=scaffold,scaffolding"
+  },
+  "ata plumbing & drain cleaning": {
+    "score": -2,
+    "reasons": "negative=plumbing"
+  },
+  "safetech scaffold ltd": {
+    "score": 3,
+    "reasons": "strong=scaffold"
+  },
+  "lns services": {
+    "score": 3,
+    "reasons": "context=services,contractor;types=general_contractor"
+  },
+  "adler construction services": {
+    "score": 3,
+    "reasons": "context=services,construction;types=general_contractor"
+  },
+  "604-fix-leak": {
+    "score": 2,
+    "reasons": "context=contractor;types=general_contractor"
+  },
+  "ikon insulation ltd": {
+    "score": 5,
+    "reasons": "strong=insulation;context=contractor;types=general_contractor"
+  },
+  "insulationbc.com": {
+    "score": 5,
+    "reasons": "strong=insulation;context=contractor;types=general_contractor"
+  },
+  "master fix building ltd.": {
+    "score": 0,
+    "reasons": "context=contractor;types=general_contractor;negative=plumber"
+  },
+  "firestop caulking supply ltd.": {
+    "score": 0,
+    "reasons": "no_signals"
+  },
+  "tiffin plumbing & drainage burnaby": {
+    "score": 0,
+    "reasons": "context=contractor;types=general_contractor;negative=plumbing"
+  },
+  "oriah contracting": {
+    "score": 0,
+    "reasons": "no_signals"
+  },
+  "pacific sandblasting": {
+    "score": 3,
+    "reasons": "strong=sandblasting"
+  },
+  "harris coating systems ltd": {
+    "score": 6,
+    "reasons": "strong=coating,coatings"
+  },
+  "metropolitan building maintenance ltd.": {
+    "score": 0,
+    "reasons": "no_signals"
+  },
+  "aarc-west scaffolding": {
+    "score": 6,
+    "reasons": "strong=scaffold,scaffolding"
+  },
+  "seneca building maintenance ltd.": {
+    "score": 0,
+    "reasons": "no_signals"
+  },
+  "aarc-west industrial coatings": {
+    "score": 7,
+    "reasons": "strong=coating,coatings;context=industrial"
+  },
+  "edge industrial flooring ltd": {
+    "score": 1,
+    "reasons": "context=industrial,contractor;types=general_contractor;negative=flooring"
+  },
+  "vancouver foam insulation": {
+    "score": 5,
+    "reasons": "strong=insulation;context=contractor;types=general_contractor"
+  },
+  "ja excavation ltd.": {
+    "score": 2,
+    "reasons": "context=contractor;types=general_contractor"
+  },
+  "stage": {
+    "score": 3,
+    "reasons": "strong=coating"
+  },
+  "metro standard insulation ltd": {
+    "score": 5,
+    "reasons": "strong=insulation;context=contractor;types=general_contractor"
+  },
+  "gisborne group": {
+    "score": 2,
+    "reasons": "context=contractor;types=general_contractor"
+  },
+  "skyline scaffold ltd": {
+    "score": 3,
+    "reasons": "strong=scaffold"
+  },
+  "allweld mobile sandblasting": {
+    "score": 3,
+    "reasons": "strong=sandblasting"
+  },
+  "janicorp building maintenance ltd.": {
+    "score": 0,
+    "reasons": "no_signals"
+  },
+  "metro insulation ltd": {
+    "score": 5,
+    "reasons": "strong=insulation;context=contractor;types=general_contractor"
+  },
+  "greer spray foam ltd.": {
+    "score": 2,
+    "reasons": "context=contractor;types=general_contractor"
+  },
+  "corrosion service company limited": {
+    "score": 0,
+    "reasons": "no_signals"
+  },
+  "scaffold depot": {
+    "score": 3,
+    "reasons": "strong=scaffold"
+  },
+  "sitka scaffold": {
+    "score": 3,
+    "reasons": "strong=scaffold"
+  },
+  "altech custom coaters ltd": {
+    "score": 0,
+    "reasons": "no_signals"
+  },
+  "tin tech inc.": {
+    "score": 2,
+    "reasons": "context=contractor;types=general_contractor"
+  },
+  "suspended stages": {
+    "score": 0,
+    "reasons": "no_signals"
+  },
+  "division7 spray foam insulation": {
+    "score": 5,
+    "reasons": "strong=insulation;context=contractor;types=general_contractor"
+  },
+  "westcor thermal": {
+    "score": 2,
+    "reasons": "context=contractor;types=general_contractor"
+  },
+  "apex scaffold ltd": {
+    "score": 5,
+    "reasons": "strong=scaffold;context=contractor;types=general_contractor"
+  },
+  "valley industrial services ltd.": {
+    "score": 3,
+    "reasons": "context=services,industrial;types=general_contractor"
+  },
+  "coast industrial maintenance & machine ltd": {
+    "score": 1,
+    "reasons": "context=industrial"
+  },
+  "southwest contracting ltd.": {
+    "score": 2,
+    "reasons": "context=contractor;types=general_contractor"
+  },
+  "h & s insulation ltd.": {
+    "score": 5,
+    "reasons": "strong=insulation;context=contractor;types=general_contractor"
+  }
+}
