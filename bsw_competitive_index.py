@@ -1,1643 +1,1345 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+"""brand_competitor_counts_v5.py
+
+BrandSafway Competitor Mapping (Client-Ready)
+============================================
+
+Goal
+----
+For each BrandSafway branch (lat/lon), identify nearby competitor locations within a
+specified radius (default: 30 miles) using Google Places API, then enrich each
+competitor with:
+  - Company size bucket (Micro/Small/Mid/Large/Enterprise/Unknown)
+  - Estimated employee range (if available)
+  - Service offerings relevant to BrandSafway (scaffolding, forming/shoring,
+    industrial insulation, coatings/painting, motorized access)
+
+Enrichment is performed via the McKinsey QuantumBlack OpenAI Gateway using the
+Responses API with web_search enabled.
+
+Cost & Speed Optimizations
+--------------------------
+This script is optimized to keep cost low and run quickly by:
+  1) Global de-duplication: enrich each unique Google place_id once (even if it
+     appears near multiple branches).
+  2) Persistent caching: reuse enrichment results across re-runs.
+  3) Concurrency with safe throttling: parallel branch discovery + parallel
+     enrichment with global RPS and max in-flight controls.
+  4) Optional batch enrichment: send multiple companies per OpenAI call.
+
+Required Environment Variables
+------------------------------
+  - GOOGLE_PLACES_API_KEY
+  - OPENAI_API_KEY
+  - OPENAI_BASE_URL
+
+Usage
+-----
+  python brand_competitor_counts_v5.py --branches branches.csv
+
+branches.csv must contain columns:
+  - branch_id
+  - branch_name
+  - latitude
+  - longitude
+
+Outputs (in --output_dir)
+------------------------
+  - competitors_enriched.csv
+  - branch_competitor_summary.csv
+
+Notes
+-----
+- Google Places cannot guarantee returning *every* business in a radius; this
+  script uses a tuned set of keyword searches + nearby type search to maximize
+  recall for likely competitors.
+- To control cost, consider setting --max_candidates_per_branch and/or a cheaper
+  model (default is gpt-4o-mini).
 """
-Brand Industrials — Competitor Intelligence (30 miles) with AI labeling + PROGRESS + ALL-HITS XLSX
-OPTIMIZED VERSION with async rate limiting and performance improvements
 
-Inputs (CSV, header required):
-    msi_name,lat,lon   (or: name -> auto-renamed to msi_name; lng/longitude accepted)
-
-Outputs:
-    1) out/competitors_details.csv  — CLEANED (kept) rows with AI labels
-    2) out/competitors_all_hits.csv — ALL raw hits, including dropped ones, with drop_reason & kept_final
-    3) out/competitors_outputs.xlsx — Excel with 2 sheets: cleaned, all_hits
-    4) out/gpt_cache.json           — cache of LLM labels keyed by place_id
-
-Usage (PowerShell):
-    $env:GOOGLE_MAPS_API_KEY = "YOUR_GOOGLE_PLACES_KEY"
-    $env:OPENAI_API_KEY      = "YOUR_OPENAI_KEY"
-    $env:OPENAI_GPT_MODEL    = "gpt-4o"  # Optional: defaults to gpt-4o
-    pip install requests pandas openai tqdm openpyxl
-    python .\brand_competitor_counts_v5.py --input .\branch_input.csv --outdir .\out --kw-mode smart --kw-target 15 --concurrency 4 --gpt-workers 20 --gpt-rps 15 --rps 6 --log-hits --log-limit 50
-"""
+from __future__ import annotations
 
 import argparse
 import json
+import logging
 import math
 import os
-import re
-import sys
+import threading
 import time
-from typing import Dict, Iterable, List, Optional, Tuple
-from urllib.parse import urljoin, urlparse
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
 import requests
 
-import asyncio, random, uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from collections import defaultdict
+# The client runtime is expected to have the OpenAI SDK installed.
+import openai  # type: ignore
 
-# progress / printing that works even if tqdm is missing or console isn't a TTY
-try:
-    from tqdm.auto import tqdm
-    TQDM_AVAILABLE = True
-    def pwrite(msg: str):
-        try:
-            tqdm.write(str(msg))
-        except Exception:
-            print(str(msg), flush=True)
-except Exception:
-    TQDM_AVAILABLE = False
-    def tqdm(x, **kwargs):  # no-op progress bar
-        return x
-    def pwrite(msg: str):
-        print(str(msg), flush=True)
+# ---------------------------- Defaults ---------------------------- #
 
-# -----------------------
-# API Keys & Endpoints
-# -----------------------
-API_KEY = os.environ.get("GOOGLE_MAPS_API_KEY")           # <-- env var
-TEXT_URL = "https://places.googleapis.com/v1/places:searchText"
-NEARBY_URL = "https://places.googleapis.com/v1/places:searchNearby"
+DEFAULT_RADIUS_MILES = 30.0
+METERS_PER_MILE = 1609.34
 
-# OpenAI (optional but recommended)
-try:
-    from openai import OpenAI, AsyncOpenAI
-except Exception:
-    OpenAI = None
-    AsyncOpenAI = None
+PLACES_TEXT_URL = "https://places.googleapis.com/v1/places:searchText"
+PLACES_NEARBY_URL = "https://places.googleapis.com/v1/places:searchNearby"
 
-OPENAI_API_KEY  = os.environ.get("OPENAI_API_KEY")
-OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL")  # McKinsey gateway URL
-GPT_MODEL       = os.environ.get("OPENAI_GPT_MODEL", "gpt-4o")
-
-def get_openai_clients():
-    """Return (sync_client, async_client) or (None, None) if not configured."""
-    if not OPENAI_API_KEY or OpenAI is None:
-        if not OPENAI_API_KEY:
-            print("WARNING: OPENAI_API_KEY environment variable not set")
-        if OpenAI is None:
-            print("WARNING: OpenAI library not installed or import failed")
-        return None, None
-    
-    common = {"api_key": OPENAI_API_KEY}
-    if OPENAI_BASE_URL:
-        common["base_url"] = OPENAI_BASE_URL
-        print(f"Using OpenAI base URL: {OPENAI_BASE_URL}")
-    
-    try:
-        sync_client = OpenAI(**common)
-        async_client = AsyncOpenAI(**common)
-        print("OpenAI clients initialized successfully")
-        return sync_client, async_client
-    except Exception as e:
-        print(f"ERROR: Failed to initialize OpenAI clients: {e}")
-        return None, None
-
-# -----------------------
-# Async Rate Limiter
-# -----------------------
-class AsyncRateLimiter:
-    """Token bucket rate limiter for async operations."""
-    
-    def __init__(self, rate: float, burst: int = None):
-        """
-        Args:
-            rate: Requests per second
-            burst: Maximum burst capacity (defaults to rate * 2)
-        """
-        self.rate = rate
-        self.burst = burst or int(rate * 2)
-        self.tokens = self.burst
-        self.last_update = time.time()
-        self._lock = asyncio.Lock()
-    
-    async def acquire(self, tokens: int = 1):
-        """Acquire tokens, waiting if necessary."""
-        async with self._lock:
-            now = time.time()
-            # Add tokens based on elapsed time
-            elapsed = now - self.last_update
-            self.tokens = min(self.burst, self.tokens + elapsed * self.rate)
-            self.last_update = now
-            
-            # Wait if not enough tokens
-            if self.tokens < tokens:
-                wait_time = (tokens - self.tokens) / self.rate
-                await asyncio.sleep(wait_time)
-                self.tokens = 0
-            else:
-                self.tokens -= tokens
-
-# Add this class after the AsyncRateLimiter class (around line 130)
-class GPTCallTracker:
-    """Track GPT API calls, performance, and costs."""
-    
-    def __init__(self):
-        self.start_time = time.time()
-        self.total_calls = 0
-        self.successful_calls = 0
-        self.failed_calls = 0
-        self.cached_calls = 0
-        self.fast_rule_calls = 0
-        self.batch_calls = 0
-        self.total_tokens = 0
-        self.total_cost = 0.0
-        self.call_times = []
-        self.error_counts = defaultdict(int)
-        
-    def log_call(self, call_type: str, success: bool, tokens: int = 0, cost: float = 0.0, 
-                 call_time: float = 0.0, error: str = None):
-        """Log a GPT API call."""
-        self.total_calls += 1
-        if success:
-            self.successful_calls += 1
-        else:
-            self.failed_calls += 1
-            if error:
-                self.error_counts[error] += 1
-        
-        if call_type == "cached":
-            self.cached_calls += 1
-        elif call_type == "fast_rule":
-            self.fast_rule_calls += 1
-        elif call_type == "batch":
-            self.batch_calls += 1
-            
-        self.total_tokens += tokens
-        self.total_cost += cost
-        if call_time > 0:
-            self.call_times.append(call_time)
-    
-    def get_stats(self) -> dict:
-        """Get current statistics."""
-        elapsed = time.time() - self.start_time
-        avg_call_time = sum(self.call_times) / len(self.call_times) if self.call_times else 0
-        calls_per_minute = (self.total_calls / elapsed) * 60 if elapsed > 0 else 0
-        
-        return {
-            "elapsed_time": elapsed,
-            "total_calls": self.total_calls,
-            "successful_calls": self.successful_calls,
-            "failed_calls": self.failed_calls,
-            "cached_calls": self.cached_calls,
-            "fast_rule_calls": self.fast_rule_calls,
-            "batch_calls": self.batch_calls,
-            "total_tokens": self.total_tokens,
-            "total_cost": self.total_cost,
-            "avg_call_time": avg_call_time,
-            "calls_per_minute": calls_per_minute,
-            "success_rate": (self.successful_calls / self.total_calls * 100) if self.total_calls > 0 else 0,
-            "error_counts": dict(self.error_counts)
-        }
-    
-    def print_progress(self, current: int, total: int):
-        """Print progress with GPT call stats."""
-        stats = self.get_stats()
-        progress_pct = (current / total * 100) if total > 0 else 0
-        
-        print(f"\n🤖 GPT Progress: {current}/{total} ({progress_pct:.1f}%)")
-        print(f"   📊 Calls: {stats['total_calls']} total, {stats['successful_calls']} success, {stats['failed_calls']} failed")
-        print(f"   ⚡ Speed: {stats['calls_per_minute']:.1f} calls/min, {stats['avg_call_time']:.2f}s avg")
-        print(f"   💰 Cost: ${stats['total_cost']:.4f}, {stats['total_tokens']:,} tokens")
-        print(f"   🎯 Success Rate: {stats['success_rate']:.1f}%")
-        
-        if stats['cached_calls'] > 0:
-            print(f"   💾 Cached: {stats['cached_calls']}, Fast Rules: {stats['fast_rule_calls']}")
-        
-        if stats['error_counts']:
-            print(f"   ❌ Errors: {dict(stats['error_counts'])}")
-
-# -----------------------
-# Geometry & pacing
-# -----------------------
-RADIUS_M = 48280  # 30 miles in meters
-MAX_RPS = 5
-SLEEP_BETWEEN_PAGES = 0.6
-
-# -----------------------
-# Domain keywords & filters
-# -----------------------
-KEYWORDS = [
-    "scaffolding", "scaffold", "scaffold rental", "scaffold services",
-    "swing stage", "suspended scaffolding", "mast climber",
-    "construction hoist", "industrial access", "access solutions",
-    "rope access", "shoring", "forming"
-]
-KW_BASIC = ["scaffold", "scaffolding", "scaffold rental"]  # fast starters
-KW_FULL  = KEYWORDS
-
-# Service type keyword mappings based on industry descriptions
-SERVICE_TYPE_KEYWORDS = {
-    "scaffolding": [
-        # Scaffolding services
-        "scaffolding", "scaffold", "scaffold rental", "scaffold services", "scaffold erection",
-        "swing stage", "suspended scaffolding", "mast climber", "construction hoist", 
-        "industrial access", "access solutions", "rope access", "commercial scaffolding",
-        "industrial scaffolding", "multi-offering project", "bridge access",
-        "industrial mechanical access", "industrial rope access", "commercial mechanical access",
-        "commercial rope access", "mcwp mast climber work platform", "elevator", 
-        "industrial powered access"
-    ],
-    "forming_shoring": [
-        # Forming/Shoring services
-        "concrete construction", "forming", "shoring", "formwork", "concrete forming",
-        "shoring systems", "concrete shoring", "forming systems", "falsework"
-    ],
-    "insulation": [
-        # Insulation services
-        "insulation", "thermal insulation", "industrial insulation", "pipe insulation",
-        "equipment insulation", "mechanical insulation", "hvac insulation"
-    ],
-    "motorized": [
-        # Motorized services
-        "motorized", "powered access", "aerial lift", "boom lift", "scissor lift",
-        "cherry picker", "man lift", "aerial work platform", "awp", "mewp",
-        "mobile elevated work platform", "telescopic boom", "articulating boom"
-    ],
-    "painting": [
-        # Painting & Coatings services
-        "painting", "coatings", "protective coatings", "industrial painting", "commercial painting",
-        "surface preparation", "sandblasting", "powder coating", "spray painting", "brush painting",
-        "roller painting", "epoxy coating", "polyurethane coating", "marine coating", "automotive painting",
-        "architectural coating", "anti-corrosive coating", "primer", "paint application", "coating application",
-        "paint contractor", "coating contractor", "industrial coatings", "commercial coatings"
-    ],
-    "specialty": [
-        # Specialty services
-        "refractory", "heat tracing", "abrasive blasting", "fireproofing", "cp construction",
-        "leak detection", "repair", "cp products", "civil construction", "asbestos abatement",
-        "carpentry services", "removable covers", "grounds maintenance", 
-        "corrosion under insulation", "cp technical services", "siding", "cp tanks",
-        "ac mitigation", "safety services", "horizontal directional drill", "pipeline surveys",
-        "mechanical", "cp products non-proprietary", "corrosion services", "lead abatement",
-        "special events services", "vci vapor corr inhibitor apps", "manufacturing product sales",
-        "composite wrap", "fire stopping", "iss specialty services", "scaffold surveys",
-        "vac service", "pro services", "studbusters", "hydraulic bolting", "tensioning",
-        "janitorial", "thermal spray aluminium", "corrosion under fireproofing",
-        "thermal surveys", "non-asbestos demo", "tank maintenance services", "solar",
-        "obsolete was", "field machining", "leak sealing", "heat treating", "cabins",
-        "hot tapping"
-    ]
-}
-
-EXCLUDE_PATTERNS = [
-    "brandsafway", "brand safway", "brand industrial services",
-    "brand industrial", "safway"
-]
-
-BLOCK_TYPES = {
-    "department_store", "hardware_store", "home_improvement_store",
-    "furniture_store", "big_box_store", "supermarket", "grocery_or_supermarket",
-    "shopping_mall", "warehouse_store", "home_goods_store", "electronics_store",
-    "discount_store", "convenience_store", "car_rental", "car_dealer",
-    "gas_station", "pharmacy", "liquor_store", "pet_store", "store"
-}
-
-# US state abbreviations for multi-state detection
-US_STATES = set("""
-AL AK AZ AR CA CO CT DE FL GA HI ID IL IN IA KS KY LA ME MD MA MI MN MS MO
-MT NE NV NH NJ NM NY NC ND OH OK OR PA RI SC SD TN TX UT VT VA WA WV WI WY DC
-""".split())
-
-# -----------------------
-# CLI
-# -----------------------
-def parse_args():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--input", required=True, help="CSV with columns: msi_name,lat,lon")
-    ap.add_argument("--outdir", default="./out", help="Output directory")
-    ap.add_argument("--include-nearby", action="store_true",
-                    help="Also run Nearby Search (rank by DISTANCE, name-filtered)")
-    ap.add_argument("--rps", type=float, default=MAX_RPS, help="Max requests/sec (shared across workers)")
-    ap.add_argument("--concurrency", type=int, default=4, help="Parallel branches")
-    ap.add_argument("--gpt-workers", type=int, default=20, help="Parallel GPT calls (can be much higher with rate limiting)")
-    ap.add_argument("--gpt-rps", type=float, default=15.0, help="GPT requests per second (rate limit)")
-    ap.add_argument("--gpt-burst", type=int, default=30, help="GPT burst capacity")
-    ap.add_argument("--kw-mode", choices=["basic","smart","full"], default="smart",
-                    help="Keyword strategy: basic=3 kws, smart=escalate as needed, full=all kws")
-    ap.add_argument("--kw-target", type=int, default=12,
-                    help="Smart mode: escalate keywords until ~this many candidates per branch or all tried")
-    ap.add_argument("--max-gpt", type=int, default=0,
-                    help="Hard cap on NEW GPT classifications (0 = unlimited). Cache still used.")
-    ap.add_argument("--log-hits", action="store_true",
-                    help="Print a line for each kept competitor (name, distance, source)")
-    ap.add_argument("--log-limit", type=int, default=0,
-                    help="Max kept competitors to print per branch (0 = no limit)")
-    ap.add_argument("--batch-size", type=int, default=50, help="Batch size for processing")
-    return ap.parse_args()
-
-# -----------------------
-# Distance & Throttle
-# -----------------------
-def haversine_miles(lat1, lon1, lat2, lon2):
-    R = 3958.7613
-    dlat = math.radians(lat2 - lat1)
-    dlon = math.radians(lon2 - lon1)
-    a = math.sin(dlat / 2) ** 2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon / 2) ** 2
-    return 2 * R * math.asin(math.sqrt(a))
-
-def throttle(last_ts, rps):
-    min_interval = 1.0 / max(rps, 0.1)
-    now = time.time()
-    wait = last_ts + min_interval - now
-    if wait > 0:
-        time.sleep(wait)
-        now = time.time()
-    return now
-
-# -----------------------
-# Places API helpers (no Atmosphere fields)
-# -----------------------
-def pages(session, url, body, fieldmask, rps) -> Iterable[dict]:
-    headers = {
-        "Content-Type": "application/json",
-        "X-Goog-Api-Key": API_KEY,
-        "X-Goog-FieldMask": fieldmask
-    }
-    page_token = None
-    last_ts = 0.0
-    while True:
-        if page_token:
-            body["pageToken"] = page_token
-        last_ts = throttle(last_ts, rps)
-        r = session.post(url, json=body, headers=headers, timeout=30)
-
-        if r.status_code in (429, 500, 503):
-            # honor Retry-After when present
-            retry_after = r.headers.get("Retry-After")
-            try:
-                sleep_s = float(retry_after) if retry_after else 0.8
-            except Exception:
-                sleep_s = 0.8
-            time.sleep(sleep_s + random.random()*0.4)
-            # second attempt
-            r = session.post(url, json=body, headers=headers, timeout=30)
-        if r.status_code == 429:
-            time.sleep(1.5 + random.random()*0.5)
-        r.raise_for_status()
-
-        data = r.json()
-        yield data
-        page_token = data.get("nextPageToken")
-        if not page_token:
-            break
-        time.sleep(SLEEP_BETWEEN_PAGES)
-
-def search_text(session, lat, lon, query, rps) -> Iterable[dict]:
-    body = {
-        "textQuery": query,
-        "locationBias": {"circle": {"center": {"latitude": lat, "longitude": lon}, "radius": RADIUS_M}},
-        "pageSize": 20
-    }
-    fieldmask = (
-        "places.id,places.name,places.displayName,places.formattedAddress,"
-        "places.location,places.types,places.websiteUri,places.rating,places.userRatingCount,nextPageToken"
-    )
-    for page in pages(session, TEXT_URL, body, fieldmask, rps):
-        for p in page.get("places", []):
-            yield p
-
-def nearby_scout(session, lat, lon, rps) -> Iterable[dict]:
-    body = {
-        "rankPreference": "DISTANCE",
-        "locationRestriction": {"circle": {"center": {"latitude": lat, "longitude": lon}, "radius": RADIUS_M}},
-        "maxResultCount": 20
-    }
-    headers = {
-        "Content-Type": "application/json",
-        "X-Goog-Api-Key": API_KEY,
-        "X-Goog-FieldMask": (
-            "places.id,places.name,places.displayName,places.formattedAddress,"
-            "places.location,places.types,places.websiteUri,places.rating,places.userRatingCount"
-        )
-    }
-    last_ts = 0.0
-    last_ts = throttle(last_ts, rps)
-    r = session.post(NEARBY_URL, json=body, headers=headers, timeout=30)
-    if r.status_code in (429, 500, 503):
-        time.sleep(1.5)
-        r = session.post(NEARBY_URL, json=body, headers=headers, timeout=30)
-    r.raise_for_status()
-    return r.json().get("places", [])
-
-# -----------------------
-# Normalization & filters
-# -----------------------
-def types_blocked(types_list: List[str]) -> Optional[str]:
-    for t in types_list or []:
-        if t in BLOCK_TYPES:
-            return t
-    return None
-
-def normalize_place(msi_name, mlat, mlon, p, source, matched_kw=""):
-    name_resource = p.get("name", "")
-    place_id = name_resource.split("/", 1)[-1] if "/" in name_resource else (p.get("id") or name_resource)
-    disp = (p.get("displayName", {}) or {}).get("text", "") or ""
-    addr = p.get("formattedAddress", "")
-    loc = p.get("location", {}) or {}
-    plat, plon = loc.get("latitude"), loc.get("longitude")
-    if plat is None or plon is None:
-        return None
-    dist = haversine_miles(mlat, mlon, plat, plon)
-    types_list = p.get("types", []) or []
-    primary_type = types_list[0] if types_list else ""
-
-    row = {
-        "msi_name": msi_name,
-        "msi_lat": mlat, "msi_lon": mlon,
-        "place_id": place_id,
-        "resource_name": name_resource,
-        "name": disp,
-        "address": addr,
-        "lat": plat, "lon": plon,
-        "distance_mi": round(dist, 2),
-        "primary_type": primary_type,
-        "types": ",".join(types_list),
-        "website": p.get("websiteUri") or "",
-        "rating": p.get("rating"),
-        "userRatingCount": p.get("userRatingCount"),
-        "source": source,
-        "matched_keyword": matched_kw
-    }
-    return row
-
-def looks_like_self(vendor_name: str) -> bool:
-    s = vendor_name.lower()
-    for pat in EXCLUDE_PATTERNS:
-        if pat in s:
-            return True
-    return False
-
-def name_hits_keyword(vendor_name: str) -> bool:
-    s = vendor_name.lower()
-    for kw in KEYWORDS:
-        if kw.lower() in s:
-            return True
-    return False
-
-# -----------------------
-# Website fetching & facts extraction (fast + tiny) - OPTIMIZED
-# -----------------------
-HEADERS = {"User-Agent": "Mozilla/5.0 (Brand-Intel Bot)"}
-SLUGS = ["", "about", "services", "careers", "locations", "company", "rental", "contact"]
-
-EMP_RE = re.compile(r"\b(\d{1,3}(?:,\d{3})*|\d{2,4})\s+(?:employees|team members|staff)\b", re.I)
-ST_ABBR_RE = re.compile(r"\b([A-Z]{2})\b")
-NATION_RE = re.compile(r"\b(nationwide|coast-to-coast|across\s+\d+\s+states)\b", re.I)
-HIRE_RE = re.compile(r"\b(careers|we['']?re\s+hiring|join our team)\b", re.I)
-
-def safe_strip_html(text: str, max_chars: int = 12000) -> str:
-    text = re.sub(r"(?is)<script.*?>.*?</script>", " ", text)
-    text = re.sub(r"(?is)<style.*?>.*?</style>", " ", text)
-    text = re.sub(r"(?s)<[^>]+>", " ", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text[:max_chars]
-
-def same_host(url: str, candidate: str) -> bool:
-    try:
-        return urlparse(url).netloc == urlparse(candidate).netloc
-    except Exception:
-        return False
-
-async def gather_site_facts_async(url: str, timeout: float = 6.0, per_page_bytes: int = 120_000) -> dict:
-    """Async version of site facts gathering for better performance."""
-    out = dict(
-        homepage_text="", pages_fetched=0, employees=None, states_count=0,
-        nationwide=False, hiring=False, has_linkedin=False
-    )
-    if not url or not url.startswith(("http://", "https://")):
-        return out
-    base = url if url.endswith("/") else url + "/"
-    texts = []
-    seen = set()
-    
-    # Use aiohttp for async requests if available, fallback to sync
-    try:
-        import aiohttp
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout)) as session:
-            for slug in SLUGS:
-                u = urljoin(base, slug)
-                if u in seen: continue
-                seen.add(u)
-                try:
-                    async with session.get(u, headers=HEADERS, allow_redirects=True) as r:
-                        if r.status >= 400: continue
-                        text = safe_strip_html((await r.text())[:per_page_bytes])
-                        if not text: continue
-                        texts.append(text)
-                        out["pages_fetched"] += 1
-                        if "linkedin.com/company" in text.lower():
-                            out["has_linkedin"] = True
-                        if out["pages_fetched"] >= 4:
-                            break
-                except Exception:
-                    continue
-    except ImportError:
-        # Fallback to sync version
-        return gather_site_facts(url, timeout, per_page_bytes)
-
-    if not texts:
-        return out
-
-    # Aggregate
-    big = " ".join(texts)
-
-    # employees
-    m = EMP_RE.search(big)
-    if m:
-        try:
-            n = int(m.group(1).replace(",", ""))
-            out["employees"] = n
-        except Exception:
-            pass
-
-    # multi-state presence
-    states = {abbr for abbr in ST_ABBR_RE.findall(big) if abbr in US_STATES}
-    out["states_count"] = len(states)
-    out["nationwide"] = bool(NATION_RE.search(big))
-
-    # hiring signals
-    out["hiring"] = bool(HIRE_RE.search(big))
-
-    # sample homepage text (first page)
-    out["homepage_text"] = texts[0][:4000]
-    return out
-
-def gather_site_facts(url: str, timeout: float = 6.0, per_page_bytes: int = 120_000) -> dict:
-    """Fetch a few same-domain pages & extract signals. Very lightweight; best-effort."""
-    out = dict(
-        homepage_text="", pages_fetched=0, employees=None, states_count=0,
-        nationwide=False, hiring=False, has_linkedin=False
-    )
-    if not url or not url.startswith(("http://", "https://")):
-        return out
-    base = url if url.endswith("/") else url + "/"
-    texts = []
-    seen = set()
-    try:
-        # fetch slugs
-        for slug in SLUGS:
-            u = urljoin(base, slug)
-            if u in seen: continue
-            seen.add(u)
-            r = requests.get(u, headers=HEADERS, timeout=timeout, allow_redirects=True)
-            if r.status_code >= 400: continue
-            text = safe_strip_html(r.text[:per_page_bytes])
-            if not text: continue
-            texts.append(text)
-            out["pages_fetched"] += 1
-            if "linkedin.com/company" in r.text.lower():
-                out["has_linkedin"] = True
-            # be gentle
-            if out["pages_fetched"] >= 4:
-                break
-    except Exception:
-        pass
-
-    if not texts:
-        return out
-
-    # Aggregate
-    big = " ".join(texts)
-
-    # employees
-    m = EMP_RE.search(big)
-    if m:
-        try:
-            n = int(m.group(1).replace(",", ""))
-            out["employees"] = n
-        except Exception:
-            pass
-
-    # multi-state presence
-    states = {abbr for abbr in ST_ABBR_RE.findall(big) if abbr in US_STATES}
-    out["states_count"] = len(states)
-    out["nationwide"] = bool(NATION_RE.search(big))
-
-    # hiring signals
-    out["hiring"] = bool(HIRE_RE.search(big))
-
-    # sample homepage text (first page)
-    out["homepage_text"] = texts[0][:4000]
-    return out
-
-# -----------------------
-# GPT helpers (SAS + Size with proxies) - OPTIMIZED
-# -----------------------
-def load_cache(cache_path: str) -> Dict[str, dict]:
-    if not os.path.exists(cache_path):
-        return {}
-    try:
-        with open(cache_path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-def save_cache(cache_path: str, data: Dict[str, dict]) -> None:
-    tmp = cache_path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, cache_path)
-
-def detect_service_types(text: str, website_text: str = "") -> Dict[str, dict]:
-    """Detect service types based on keywords in name, types, and website text with enhanced accuracy."""
-    combined_text = f"{text} {website_text}".lower()
-    results = {}
-    
-    for service_type, keywords in SERVICE_TYPE_KEYWORDS.items():
-        matched_keywords = []
-        confidence_boost = 0.0
-        
-        for keyword in keywords:
-            keyword_lower = keyword.lower()
-            if keyword_lower in combined_text:
-                matched_keywords.append(keyword)
-                
-                # Higher confidence for company name matches
-                if keyword_lower in text.lower():
-                    # Check if keyword appears in company name (not just business type)
-                    name_part = text.split('|')[0].lower() if '|' in text else text.lower()
-                    if keyword_lower in name_part:
-                        confidence_boost += 0.2  # Strong signal from company name
-                    else:
-                        confidence_boost += 0.1  # Signal from business type
-                else:
-                    confidence_boost += 0.05  # Signal from website content
-        
-        if matched_keywords:
-            # Calculate confidence based on number and strength of matches
-            base_confidence = min(0.6, 0.4 + (len(matched_keywords) * 0.05))
-            final_confidence = min(0.95, base_confidence + confidence_boost)
-            
-            results[service_type] = {
-                "service": "Yes",
-                "confidence": final_confidence,
-                "matched_keywords": matched_keywords[:5]  # Limit to top 5 matches
-            }
-        else:
-            results[service_type] = {
-                "service": "Unknown",
-                "confidence": 0.0,
-                "matched_keywords": []
-            }
-    
-    return results
-
-CLASSIFY_SYS_PROMPT = (
-  "You are an expert construction-industry analyst. Classify companies across 6 service types: "
-  "Scaffolding, Forming/Shoring, Insulation, Motorized, Painting, Specialty. "
-  "Use ONLY the evidence provided in the user message, except when WELL_KNOWN_COMPANY=true; in that case, "
-  "you may supplement with widely known facts about that specific company (not generic industry assumptions). "
-  "Do not fabricate keywords or evidence; every keyword must be a literal substring from the provided evidence. "
-  "Label semantics:\n"
-  "- 'Yes' = there is affirmative evidence (direct or strongly implied) that the company provides the service.\n"
-  "- 'No'  = there is affirmative evidence of absence (e.g., a statement that the company does not offer it) "
-  "or clear scope that excludes the service.\n"
-  "- 'Unknown' = insufficient evidence either way.\n"
-  "Avoid false negatives: treat multiple weak but consistent cues across different pages as acceptable for 'Yes' "
-  "when they are action-oriented (e.g., provide/offer/rent/install/erect) or equipment/service listings. "
-  "Overlapping categories are allowed (e.g., 'mast climber' may support Scaffolding and Motorized if powered access is implied).\n"
-  "Confidence guidance (calibrate carefully, no inflation):\n"
-  "• 0.95–1.00: Service page or equipment/rental page explicitly states the service with action verbs (provide/offer/rent/install/erect), OR named product lines clearly belonging to the service.\n"
-  "• 0.85–0.90: Multiple snippets across ≥2 pages or path-weighted pages (/services, /equipment, /rentals, /solutions) with action verbs or specific equipment terms (e.g., ringlock, formwork, boom lift, intumescent).\n"
-  "• 0.70–0.80: One strong snippet with action verbs OR several consistent mentions including brand/technology terms strongly tied to the service.\n"
-  "• 0.50–0.65: Ambiguous mentions without action context → should not produce 'Yes' unless supplemented by other clear cues.\n"
-  "• 0.30–0.45: Generic or historical mentions only → typically 'Unknown'.\n"
-  "Size classification (Small 0–49, Mid 50–249, Large 250+): prioritize explicit headcount, then multi-location/scale claims ('nationwide', number of states/offices), then fleet size proxies. "
-  "Return strictly valid JSON only."
+# Include editorialSummary if you decide to expand signals later.
+PLACES_FIELDS = (
+    "places.id,places.displayName,places.formattedAddress,"
+    "places.location,places.primaryType,places.types,"
+    "places.websiteUri,places.rating,places.userRatingCount"
 )
 
+DEFAULT_KEYWORDS: List[str] = [
+    "industrial scaffolding contractor",
+    "scaffolding rental",
+    "swing stage scaffolding",
+    "forming and shoring contractor",
+    "industrial insulation contractor",
+    "industrial coatings contractor",
+    "motorized access contractor",
+]
 
-CLASSIFY_USER_TMPL = """CONSTRUCTION COMPANY ANALYSIS
+# Filter out obvious non-competitors (fast, cheap). This is intentionally
+# conservative; tune as needed.
+BLOCK_TYPES = {
+    "restaurant",
+    "cafe",
+    "bar",
+    "bakery",
+    "hotel",
+    "lodging",
+    "shopping_mall",
+    "clothing_store",
+    "shoe_store",
+    "beauty_salon",
+    "hair_care",
+    "supermarket",
+    "grocery_store",
+    "pharmacy",
+    "hospital",
+    "dentist",
+    "doctor",
+    "school",
+    "university",
+}
 
-Company: {name}
-Business Types: {types}
-Website: {website}
-Rating: {rating}/5 ({userRatingCount} reviews)
-WELL_KNOWN_COMPANY: {well_known}
+EXCLUDE_NAME_SUBSTRINGS = {
+    "brandsafway",
+    "brand safway",
+    "safway",  # removes obvious BrandSafway locations; adjust if overly aggressive
+}
 
-EVIDENCE (short, tagged snippets; each line must only includetext drawn from evidence):
-{evidence_block}
+DEFAULT_MODEL = "gpt-4o-mini"  # lower cost; override with --model if needed
 
-{web_search_results}
+SYSTEM_PROMPT = (
+    "You are an analyst mapping competitors to BrandSafway. "
+    "Use web search to determine the company's size and service offerings. "
+    "Be conservative: if you cannot verify a claim from credible sources, mark it Unknown/False and "
+    "lower confidence."
+)
 
-DECISION RULES FOR THIS TASK (apply strictly):
-- Prefer action-oriented statements (provide/offer/rent/install/erect/supply/perform) and equipment/service listings.
-- Mentions on /services, /equipment, /rentals, /solutions carry more weight than /about, /blog, or news pages.
-- Accept overlapping services if the evidence supports them (e.g., 'material hoist' → Motorized; 'mast climber' → Scaffolding and often Motorized).
-- Do NOT infer from unrelated phrases (e.g., 'insulation resistance'); ignore directories or social pages.
-- Only include keywords that literally appear in the snippets above; no invented synonyms.
-
-SERVICE DEFINITIONS (for mapping terms→services):
-1. Scaffolding: scaffolding systems, swing stages, mast climbers (as access systems), rope/suspended platforms.
-2. Forming/Shoring: formwork, shoring systems, falsework, concrete forms, formwork rental/installation.
-3. Insulation: mechanical/thermal/industrial insulation (pipe/duct/blanket/jacketing).
-4. Motorized: aerial/boom/scissor/vertical-mast lifts, telehandlers, hoists, powered access.
-5. Painting: industrial/commercial painting, protective coatings, surface prep, abrasive blasting.
-6. Specialty: refractory, fireproofing (incl. intumescent), heat tracing, leak detection, FRP/linings, hot tapping, lead/asbestos abatement.
-
-OUTPUT (strict JSON):
-{{
-  "scaffolding": {{"service": "Yes|No|Unknown", "confidence": 0.0-1.0, "evidence": "short cited line", "keywords": ["exact_terms_from_evidence"]}},
-  "forming_shoring": {{"service": "Yes|No|Unknown", "confidence": 0.0-1.0, "evidence": "short cited line", "keywords": ["exact_terms_from_evidence"]}},
-  "insulation": {{"service": "Yes|No|Unknown", "confidence": 0.0-1.0, "evidence": "short cited line", "keywords": ["exact_terms_from_evidence"]}},
-  "motorized": {{"service": "Yes|No|Unknown", "confidence": 0.0-1.0, "evidence": "short cited line", "keywords": ["exact_terms_from_evidence"]}},
-  "painting": {{"service": "Yes|No|Unknown", "confidence": 0.0-1.0, "evidence": "short cited line", "keywords": ["exact_terms_from_evidence"]}},
-  "specialty": {{"service": "Yes|No|Unknown", "confidence": 0.0-1.0, "evidence": "short cited line", "keywords": ["exact_terms_from_evidence"]}},
-  "size_bucket": "Small|Mid|Large|Unknown",
-  "size_confidence": 0.0-1.0,
-  "size_evidence": "short cited line(s) or concise reasoning tied to the evidence"
-}}
-"""
-
+# ---------------------------- Utilities ---------------------------- #
 
 
-async def classify_one_async(async_client: AsyncOpenAI, model: str, pdata: dict, facts: dict,
-                             rate_limiter: AsyncRateLimiter, max_retries: int = 6) -> dict:
-    user_prompt = CLASSIFY_USER_TMPL.format(
-        name=pdata.get("name",""),
-        address=pdata.get("address",""),
-        primary_type=pdata.get("primary_type",""),
-        types=pdata.get("types",""),
-        website=pdata.get("website",""),
-        rating=str(pdata.get("rating","")),
-        userRatingCount=str(pdata.get("userRatingCount","")),
-        employees=facts.get("employees"),
-        states_count=facts.get("states_count"),
-        nationwide=facts.get("nationwide"),
-        hiring=facts.get("hiring"),
-        has_linkedin=facts.get("has_linkedin"),
-        homepage_text=facts.get("homepage_text") or "(none)"
-    )
-    delay = 0.6
-    for _ in range(max_retries):
-        try:
-            # Apply rate limiting
-            await rate_limiter.acquire()
-            
-            resp = await async_client.chat.completions.create(
-                model=model, temperature=0.2, response_format={"type":"json_object"},
-                messages=[{"role":"system","content":CLASSIFY_SYS_PROMPT},
-                          {"role":"user","content":user_prompt}]
-            )
-            data = json.loads(resp.choices[0].message.content)
-            
-            # Parse service types
-            out = {}
-            service_types = ["scaffolding", "forming_shoring", "insulation", "motorized", "painting", "specialty"]
-            
-            for service_type in service_types:
-                service_data = data.get(service_type, {})
-                service_label = str(service_data.get("service", "Unknown")).title()
-                if service_label not in {"Yes", "No", "Unknown"}:
-                    service_label = "Unknown"
-                
-                out[f"{service_type}_label"] = service_label
-                out[f"{service_type}_confidence"] = max(0.0, min(1.0, float(service_data.get("confidence", 0.0))))
-                out[f"{service_type}_keywords"] = ",".join(service_data.get("keywords", []))
-                out[f"{service_type}_evidence"] = service_data.get("evidence", "")
-            
-            # Parse size information
-            out["size_bucket"] = str(data.get("size_bucket", "Unknown")).title()
-            if out["size_bucket"] not in {"Micro", "Small", "Mid", "Large", "Unknown"}:
-                out["size_bucket"] = "Unknown"
-            out["size_confidence"] = max(0.0, min(1.0, float(data.get("size_confidence", 0.0))))
-            out["size_evidence"] = data.get("size_evidence", "")
-            
-            # Apply heuristic size if still unknown
-            if out["size_bucket"] == "Unknown":
-                h = heuristic_size_from_facts(facts)
-                if h:
-                    out["size_bucket"] = h["size_bucket"]
-                    out["size_confidence"] = max(out["size_confidence"], h["size_confidence"])
-                    out["size_evidence"] = out["size_evidence"] or h["size_evidence"]
-            
-            return out
-        except Exception as e:
-            msg = str(e).lower()
-            error_type = type(e).__name__
-            
-            # Handle authorization errors specifically
-            if ("401" in msg) or ("403" in msg) or ("unauthorized" in msg) or ("forbidden" in msg):
-                error_result = {"size_bucket":"Unknown","size_confidence":0.0,"size_evidence":f"auth_error:{error_type}"}
-                service_types = ["scaffolding", "forming_shoring", "insulation", "motorized", "painting", "specialty"]
-                for service_type in service_types:
-                    error_result[f"{service_type}_label"] = "Unknown"
-                    error_result[f"{service_type}_confidence"] = 0.0
-                    error_result[f"{service_type}_keywords"] = f"auth_error:{error_type}"
-                    error_result[f"{service_type}_evidence"] = f"auth_error:{error_type}"
-                return error_result
-            
-            # Handle retryable errors
-            if ("rate" in msg) or ("429" in msg) or ("timeout" in msg) or ("503" in msg) or ("temporar" in msg):
-                await asyncio.sleep(delay + random.random()*0.4)
-                delay = min(delay*2, 8.0)
-                continue
-                
-            # Handle other errors
-            error_result = {"size_bucket":"Unknown","size_confidence":0.0,"size_evidence":f"gpt_error:{error_type}"}
-            service_types = ["scaffolding", "forming_shoring", "insulation", "motorized", "painting", "specialty"]
-            for service_type in service_types:
-                error_result[f"{service_type}_label"] = "Unknown"
-                error_result[f"{service_type}_confidence"] = 0.0
-                error_result[f"{service_type}_keywords"] = f"gpt_error:{error_type}"
-                error_result[f"{service_type}_evidence"] = f"gpt_error:{error_type}"
-            return error_result
-    
-    # Final fallback for rate limiting
-    error_result = {"size_bucket":"Unknown","size_confidence":0.0,"size_evidence":"gpt_error:rate_limited"}
-    service_types = ["scaffolding", "forming_shoring", "insulation", "motorized", "painting", "specialty"]
-    for service_type in service_types:
-        error_result[f"{service_type}_label"] = "Unknown"
-        error_result[f"{service_type}_confidence"] = 0.0
-        error_result[f"{service_type}_keywords"] = "gpt_error:rate_limited"
-        error_result[f"{service_type}_evidence"] = "gpt_error:rate_limited"
-    return error_result
+class RateLimiter:
+    """Thread-safe rate limiter enforcing a maximum calls-per-second rate."""
 
-async def classify_batch_async(async_client: AsyncOpenAI, model: str,
-                               to_classify: List[str],
-                               uniq_by_place: Dict[str,dict],
-                               facts_by_place: Dict[str,dict],
-                               rate_limiter: AsyncRateLimiter,
-                               tracker: GPTCallTracker,
-                               max_concurrency: int = 100) -> Dict[str, dict]:
-    """Ultra-fast batch processing with 20 places per GPT call."""
-    results: Dict[str, dict] = {}
-    
-    # Process in batches of 20 for maximum efficiency
-    batch_size = 20
-    total_batches = (len(to_classify) + batch_size - 1) // batch_size
-    
-    for i in range(0, len(to_classify), batch_size):
-        batch = to_classify[i:i + batch_size]
-        batch_num = (i // batch_size) + 1
-        
-        # Create single prompt for entire batch
-        batch_prompt = "Classify these businesses for scaffolding services:\n\n"
-        for j, pid in enumerate(batch):
-            pdata = uniq_by_place[pid]
-            batch_prompt += f"{j+1}. {pdata['name']} | {pdata['types']} | {pdata['website']}\n"
-        
-        batch_prompt += f"\nReturn JSON: {{'results': [{{ 'scaffolding': {{'service': 'Yes|No|Unknown', 'confidence': 0.0-1.0, 'evidence': 'evidence', 'keywords': []}}, 'forming_shoring': {{'service': 'Yes|No|Unknown', 'confidence': 0.0-1.0, 'evidence': 'evidence', 'keywords': []}}, 'insulation': {{'service': 'Yes|No|Unknown', 'confidence': 0.0-1.0, 'evidence': 'evidence', 'keywords': []}}, 'motorized': {{'service': 'Yes|No|Unknown', 'confidence': 0.0-1.0, 'evidence': 'evidence', 'keywords': []}}, 'painting': {{'service': 'Yes|No|Unknown', 'confidence': 0.0-1.0, 'evidence': 'evidence', 'keywords': []}}, 'specialty': {{'service': 'Yes|No|Unknown', 'confidence': 0.0-1.0, 'evidence': 'evidence', 'keywords': []}}, 'size_bucket': 'Micro|Small|Mid|Large|Unknown', 'size_confidence': 0.0-1.0, 'size_evidence': '' }}, ...]}}"
-        
-        await rate_limiter.acquire()
-        
-        start_time = time.time()
-        try:
-            resp = await async_client.chat.completions.create(
-                model=model,
-                temperature=0.1,
-                response_format={"type":"json_object"},
-                messages=[{"role":"user","content":batch_prompt}]
-            )
-            
-            call_time = time.time() - start_time
-            
-            # Estimate tokens and cost (rough estimates)
-            input_tokens = len(batch_prompt) // 4  # Rough estimate
-            output_tokens = len(batch) * 20  # Rough estimate for JSON response
-            total_tokens = input_tokens + output_tokens
-            cost = total_tokens * 0.0000015  # Rough cost estimate for gpt-3.5-turbo
-            
-            # Log successful batch call
-            tracker.log_call("batch", True, total_tokens, cost, call_time)
-            
-            # Parse batch response
-            data = json.loads(resp.choices[0].message.content)
-            batch_results = data.get("results", [])
-            
-            for j, pid in enumerate(batch):
-                if j < len(batch_results):
-                    result = batch_results[j]
-                    batch_result = {}
-                    
-                    # Parse service types
-                    service_types = ["scaffolding", "forming_shoring", "insulation", "motorized", "painting", "specialty"]
-                    for service_type in service_types:
-                        service_data = result.get(service_type, {})
-                        service_label = str(service_data.get("service", "Unknown")).title()
-                        if service_label not in {"Yes", "No", "Unknown"}:
-                            service_label = "Unknown"
-                        
-                        batch_result[f"{service_type}_label"] = service_label
-                        batch_result[f"{service_type}_confidence"] = max(0.0, min(1.0, float(service_data.get("confidence", 0.8))))
-                        batch_result[f"{service_type}_keywords"] = ",".join(service_data.get("keywords", []))
-                        batch_result[f"{service_type}_evidence"] = service_data.get("evidence", "batch_classification")
-                    
-                    # Parse size
-                    batch_result["size_bucket"] = str(result.get("size_bucket","Unknown")).title()
-                    batch_result["size_confidence"] = max(0.0, min(1.0, float(result.get("size_confidence", 0.8))))
-                    batch_result["size_evidence"] = result.get("size_evidence", "batch_classification")
-                    
-                    results[pid] = batch_result
-                else:
-                    error_result = {"size_bucket":"Unknown","size_confidence":0.0,"size_evidence":"batch_error"}
-                    service_types = ["scaffolding", "forming_shoring", "insulation", "motorized", "painting", "specialty"]
-                    for service_type in service_types:
-                        error_result[f"{service_type}_label"] = "Unknown"
-                        error_result[f"{service_type}_confidence"] = 0.0
-                        error_result[f"{service_type}_keywords"] = "batch_error"
-                        error_result[f"{service_type}_evidence"] = "batch_error"
-                    results[pid] = error_result
-            
-            # Print progress every 3 batches or on completion
-            if batch_num % 3 == 0 or batch_num == total_batches:
-                elapsed = time.time() - tracker.start_time
-                rate = batch_num / elapsed * 60 if elapsed > 0 else 0
-                remaining = total_batches - batch_num
-                eta = remaining / (batch_num / elapsed) if batch_num > 0 and elapsed > 0 else 0
-                
-                print(f"   📈 Batch {batch_num}/{total_batches} ({batch_num/total_batches*100:.1f}%) | "
-                      f"Rate: {rate:.1f} batches/min | ETA: {eta/60:.1f} min")
-                
-                if batch_num == total_batches:
-                    tracker.print_progress(batch_num, total_batches)
-                    
-        except Exception as e:
-            call_time = time.time() - start_time
-            error_type = type(e).__name__
-            
-            # Log failed batch call
-            tracker.log_call("batch", False, 0, 0, call_time, error_type)
-            
-            # Handle errors for entire batch
-            for pid in batch:
-                error_result = {"size_bucket":"Unknown","size_confidence":0.0,"size_evidence":f"batch_error:{error_type}"}
-                service_types = ["scaffolding", "forming_shoring", "insulation", "motorized", "painting", "specialty"]
-                for service_type in service_types:
-                    error_result[f"{service_type}_label"] = "Unknown"
-                    error_result[f"{service_type}_confidence"] = 0.0
-                    error_result[f"{service_type}_keywords"] = f"batch_error:{error_type}"
-                    error_result[f"{service_type}_evidence"] = f"batch_error:{error_type}"
-                results[pid] = error_result
-    
-    return results
+    def __init__(self, calls_per_second: float):
+        if calls_per_second <= 0:
+            raise ValueError("calls_per_second must be > 0")
+        self._interval = 1.0 / calls_per_second
+        self._lock = threading.Lock()
+        self._last_call = 0.0
 
-def fast_rule_label_enhanced(place: dict) -> Optional[dict]:
-    """Enhanced fast rules to skip more GPT calls - handles multiple service types."""
-    name = (place.get("name") or "").lower()
-    types = (place.get("types") or "").lower()
-    text = f"{name} {types}"
-    
-    # Detect service types using keyword matching
-    service_detections = detect_service_types(text)
-    
-    # Check if any service type was detected with high confidence
-    any_service_detected = False
-    for service_type, detection in service_detections.items():
-        if detection["service"] == "Yes" and detection["confidence"] >= 0.8:
-            any_service_detected = True
-            break
-    
-    if any_service_detected:
-        # Build result with all service types
-        result = {"size_bucket": "Unknown", "size_confidence": 0.0, "size_evidence": "not evaluated"}
-        
-        for service_type in ["scaffolding", "forming_shoring", "insulation", "motorized", "painting", "specialty"]:
-            detection = service_detections[service_type]
-            result[f"{service_type}_label"] = detection["service"]
-            result[f"{service_type}_confidence"] = detection["confidence"]
-            result[f"{service_type}_keywords"] = ",".join(detection["matched_keywords"])
-        
-        return result
-    
-    # Strong negative indicators (no services detected)
-    NEG_STRONG = ["hardware store", "home depot", "lowes", "ace hardware", "retail", "store"]
-    if any(k in text for k in NEG_STRONG) and "rental" not in text and "service" not in text:
-        result = {"size_bucket": "Unknown", "size_confidence": 0.0, "size_evidence": "not evaluated"}
-        service_types = ["scaffolding", "forming_shoring", "insulation", "motorized", "painting", "specialty"]
-        for service_type in service_types:
-            result[f"{service_type}_label"] = "No"
-            result[f"{service_type}_confidence"] = 0.9
-            result[f"{service_type}_keywords"] = "rule: retail store"
-        return result
-    
-    # Block obvious non-construction types
-    if place.get("primary_type") in BLOCK_TYPES and "rental" not in text and "service" not in text:
-        result = {"size_bucket": "Unknown", "size_confidence": 0.0, "size_evidence": "not evaluated"}
-        service_types = ["scaffolding", "forming_shoring", "insulation", "motorized", "painting", "specialty"]
-        for service_type in service_types:
-            result[f"{service_type}_label"] = "No"
-            result[f"{service_type}_confidence"] = 0.85
-            result[f"{service_type}_keywords"] = "rule: blocked type"
-        return result
-    
-    return None
+    def wait(self) -> None:
+        with self._lock:
+            now = time.time()
+            elapsed = now - self._last_call
+            if elapsed < self._interval:
+                time.sleep(self._interval - elapsed)
+            self._last_call = time.time()
 
-def heuristic_size_from_facts(facts: dict) -> Optional[dict]:
-    """Fallback if GPT still returns Unknown."""
-    emp = facts.get("employees")
-    if isinstance(emp, int):
-        if emp >= 250: return {"size_bucket":"Large","size_confidence":0.85,"size_evidence":f"employees≈{emp}"}
-        if emp >= 50:  return {"size_bucket":"Mid","size_confidence":0.8,"size_evidence":f"employees≈{emp}"}
-        if emp >= 10:  return {"size_bucket":"Small","size_confidence":0.7,"size_evidence":f"employees≈{emp}"}
-        if emp >= 1:   return {"size_bucket":"Micro","size_confidence":0.7,"size_evidence":f"employees≈{emp}"}
-    states = facts.get("states_count", 0)
-    if facts.get("nationwide") or states >= 10:
-        return {"size_bucket":"Large","size_confidence":0.7,"size_evidence":"nationwide/states>=10"}
-    if states >= 4:
-        return {"size_bucket":"Mid","size_confidence":0.6,"size_evidence":"states>=4"}
-    if states in (2,3):
-        return {"size_bucket":"Small","size_confidence":0.55,"size_evidence":"states=2-3"}
-    return None
 
-def classify_with_gpt(client: "OpenAI", place: dict, facts: dict) -> dict:
-    user_prompt = CLASSIFY_USER_TMPL.format(
-        name=place.get("name",""),
-        address=place.get("address",""),
-        primary_type=place.get("primary_type",""),
-        types=place.get("types",""),
-        website=place.get("website",""),
-        rating=str(place.get("rating","")),
-        userRatingCount=str(place.get("userRatingCount","")),
-        employees=facts.get("employees"),
-        states_count=facts.get("states_count"),
-        nationwide=facts.get("nationwide"),
-        hiring=facts.get("hiring"),
-        has_linkedin=facts.get("has_linkedin"),
-        homepage_text=facts.get("homepage_text") or "(none)"
-    )
-    try:
-        resp = client.chat.completions.create(
-            model=GPT_MODEL,
-            temperature=0.2,
-            response_format={"type":"json_object"},
-            messages=[
-                {"role":"system","content":CLASSIFY_SYS_PROMPT},
-                {"role":"user","content":user_prompt},
-            ],
-        )
-        data = json.loads(resp.choices[0].message.content)
-        
-        # Parse service types
-        out = {}
-        service_types = ["scaffolding", "forming_shoring", "insulation", "motorized", "painting", "specialty"]
-        
-        for service_type in service_types:
-            service_data = data.get(service_type, {})
-            service_label = str(service_data.get("service", "Unknown")).title()
-            if service_label not in {"Yes", "No", "Unknown"}:
-                service_label = "Unknown"
-            
-            out[f"{service_type}_label"] = service_label
-            out[f"{service_type}_confidence"] = max(0.0, min(1.0, float(service_data.get("confidence", 0.0))))
-            out[f"{service_type}_keywords"] = ",".join(service_data.get("keywords", []))
-            out[f"{service_type}_evidence"] = service_data.get("evidence", "")
-        
-        # Parse size information
-        out["size_bucket"] = str(data.get("size_bucket", "Unknown")).title()
-        if out["size_bucket"] not in {"Micro", "Small", "Mid", "Large", "Unknown"}:
-            out["size_bucket"] = "Unknown"
-        out["size_confidence"] = max(0.0, min(1.0, float(data.get("size_confidence", 0.0))))
-        out["size_evidence"] = data.get("size_evidence", "")
-        
-        # Apply heuristic size if still unknown
-        if out["size_bucket"] == "Unknown":
-            h = heuristic_size_from_facts(facts)
-            if h:
-                out["size_bucket"] = h["size_bucket"]
-                out["size_confidence"] = max(out["size_confidence"], h["size_confidence"])
-                out["size_evidence"] = out["size_evidence"] or h["size_evidence"]
-        
-        return out
-    except Exception as e:
-        msg = str(e).lower()
-        error_type = type(e).__name__
-        
-        # Handle authorization errors specifically
-        if ("401" in msg) or ("403" in msg) or ("unauthorized" in msg) or ("forbidden" in msg):
-            error_result = {"size_bucket":"Unknown","size_confidence":0.0,"size_evidence":f"auth_error:{error_type}"}
-            service_types = ["scaffolding", "forming_shoring", "insulation", "motorized", "painting", "specialty"]
-            for service_type in service_types:
-                error_result[f"{service_type}_label"] = "Unknown"
-                error_result[f"{service_type}_confidence"] = 0.0
-                error_result[f"{service_type}_keywords"] = f"auth_error:{error_type}"
-                error_result[f"{service_type}_evidence"] = f"auth_error:{error_type}"
-            return error_result
-        
-        error_result = {"size_bucket":"Unknown","size_confidence":0.0,"size_evidence":f"gpt_error:{error_type}"}
-        service_types = ["scaffolding", "forming_shoring", "insulation", "motorized", "painting", "specialty"]
-        for service_type in service_types:
-            error_result[f"{service_type}_label"] = "Unknown"
-            error_result[f"{service_type}_confidence"] = 0.0
-            error_result[f"{service_type}_keywords"] = f"gpt_error:{error_type}"
-            error_result[f"{service_type}_evidence"] = f"gpt_error:{error_type}"
-        return error_result
+def haversine_miles(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Great-circle distance between two coordinates, in miles."""
 
-# -----------------------
-# Branch processing (to enable parallelism) - OPTIMIZED
-# -----------------------
-def process_branch(row, include_nearby: bool, rps: float, kw_mode: str, kw_target: int) -> Tuple[List[dict], List[dict], dict]:
-    msi_name, mlat, mlon = row["msi_name"], float(row["lat"]), float(row["lon"])
-    pwrite(f"→ Scanning {msi_name} (lat={mlat}, lon={mlon})")
+    r = 3958.8  # Earth radius in miles
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
 
-    kept_rows: List[dict] = []
-    all_hits_rows: List[dict] = []
-    counters = dict(kept=0, drop_type=0, drop_self=0, drop_far=0)
-    seen_ids: Dict[str, dict] = {}
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
+    return r * (2 * math.atan2(math.sqrt(a), math.sqrt(1 - a)))
 
-    def record_hit(base_row: dict, reason: str):
-        rec = dict(base_row); rec["drop_reason"] = reason; rec["kept_final"] = "No"
-        all_hits_rows.append(rec)
 
-    def kw_sets():
-        yield KW_BASIC
-        if kw_mode in ("smart","full"):
-            yield [k for k in KW_FULL if k not in KW_BASIC]
+def normalize_text(s: str) -> str:
+    return " ".join((s or "").strip().lower().split())
 
-    total_candidates = 0
-    with requests.Session() as s:
-        for kws in kw_sets():
-            for kw in kws:
-                for p in search_text(s, mlat, mlon, kw, rps=rps):
-                    disp = (p.get("displayName") or {}).get("text","")
-                    norm = normalize_place(msi_name, mlat, mlon, p, source="text_search", matched_kw=kw)
-                    if not norm: continue
-                    if looks_like_self(disp):
-                        counters["drop_self"] += 1; record_hit(norm, "self_brand"); continue
-                    tblock = types_blocked(p.get("types", []))
-                    if tblock:
-                        counters["drop_type"] += 1; record_hit(norm, f"blocked_type:{tblock}"); continue
-                    if norm["distance_mi"] > 30:
-                        counters["drop_far"] += 1; record_hit(norm, "beyond_30mi"); continue
-                    record_hit(norm, "")
-                    total_candidates += 1
-                    pid = norm["place_id"]
-                    if pid not in seen_ids or norm["distance_mi"] < seen_ids[pid]["distance_mi"]:
-                        seen_ids[pid] = norm
-            if kw_mode == "smart" and total_candidates >= kw_target:
-                break
 
-        do_nearby = include_nearby and (kw_mode != "smart" or total_candidates < kw_target)
-        if do_nearby:
-            for p in nearby_scout(s, mlat, mlon, rps=rps):
-                disp = (p.get("displayName") or {}).get("text","")
-                if not name_hits_keyword(disp):
-                    continue
-                norm = normalize_place(msi_name, mlat, mlon, p, source="nearby_scout", matched_kw="name_match")
-                if not norm: continue
-                if looks_like_self(disp):
-                    counters["drop_self"] += 1; record_hit(norm, "self_brand"); continue
-                tblock = types_blocked(p.get("types", []))
-                if tblock:
-                    counters["drop_type"] += 1; record_hit(norm, f"blocked_type:{tblock}"); continue
-                if norm["distance_mi"] > 30:
-                    counters["drop_far"] += 1; record_hit(norm, "beyond_30mi"); continue
-                record_hit(norm, "")
-                pid = norm["place_id"]
-                if pid not in seen_ids or norm["distance_mi"] < seen_ids[pid]["distance_mi"]:
-                    seen_ids[pid] = norm
+def chunked(items: List[Any], size: int) -> Iterable[List[Any]]:
+    for i in range(0, len(items), size):
+        yield items[i : i + size]
 
-    # mark kept vs farther duplicates
-    kept_map = {pid: r["distance_mi"] for pid, r in seen_ids.items()}
-    for rec in all_hits_rows:
-        if rec["drop_reason"] == "":
-            pid = rec["place_id"]
-            if pid in kept_map and abs(rec["distance_mi"] - kept_map[pid]) < 1e-6:
-                rec["kept_final"] = "Yes"
-            else:
-                rec["drop_reason"] = "duplicate_farther"
 
-    kept_rows = list(seen_ids.values())
-    counters["kept"] = len(kept_rows)
-    return kept_rows, all_hits_rows, counters
+def ensure_env(var_name: str) -> str:
+    value = os.getenv(var_name)
+    if not value:
+        raise RuntimeError(f"Missing required environment variable: {var_name}")
+    return value
 
-def safe_to_csv(df: pd.DataFrame, path: str, retries: int = 5, base_sleep: float = 0.7):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    last_err = None
-    for i in range(retries):
-        tmp = f"{path}.{uuid.uuid4().hex}.tmp"
-        try:
-            df.to_csv(tmp, index=False)
-            os.replace(tmp, path)
+
+def safe_json_dump(path: Path, data: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(path)
+
+
+# ---------------------------- Data Models ---------------------------- #
+
+
+@dataclass(frozen=True)
+class Branch:
+    branch_id: str
+    branch_name: str
+    latitude: float
+    longitude: float
+
+
+@dataclass
+class PlaceCandidate:
+    branch_id: str
+    branch_name: str
+    branch_latitude: float
+    branch_longitude: float
+
+    place_id: str
+    company_name: str
+    address: str
+    latitude: float
+    longitude: float
+    website: str
+    primary_type: str
+    types: str
+    rating: Optional[float]
+    user_rating_count: Optional[int]
+
+    distance_miles: float
+
+
+# ---------------------------- Persistent Cache ---------------------------- #
+
+
+class JsonCache:
+    """Simple persistent JSON cache with optional TTL."""
+
+    def __init__(self, path: Path, ttl_days: Optional[int] = None):
+        self._path = path
+        self._ttl_seconds = ttl_days * 86400 if ttl_days else None
+        self._lock = threading.Lock()
+        self._data: Dict[str, Dict[str, Any]] = {}
+        self._dirty = False
+        self._load()
+
+    def _load(self) -> None:
+        if not self._path.exists():
             return
-        except PermissionError as e:
-            last_err = e
-            try:
-                if os.path.exists(tmp): os.remove(tmp)
-            except Exception:
-                pass
-            time.sleep(base_sleep * (2 ** i))
-    fallback = os.path.join(os.path.dirname(path),
-                            f"{os.path.splitext(os.path.basename(path))[0]}_{int(time.time())}.csv")
-    try:
-        df.to_csv(fallback, index=False)
-        print(f"! Could not overwrite locked file. Wrote fallback: {fallback}")
-        return
-    except Exception:
-        pass
-    raise last_err or PermissionError(f"Could not write {path}")
-
-def safe_to_xlsx(cleaned_df: pd.DataFrame, all_hits_df: pd.DataFrame, path: str,
-                 cleaned_cols: list, all_hits_cols: list, retries: int = 5, base_sleep: float = 0.7):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    last_err = None
-    for i in range(retries):
-        tmp = f"{path}.{uuid.uuid4().hex}.tmp"
         try:
-            with pd.ExcelWriter(tmp) as writer:
-                cleaned_df[cleaned_cols].to_excel(writer, sheet_name="cleaned", index=False)
-                (all_hits_df[all_hits_cols] if not all_hits_df.empty else pd.DataFrame(columns=all_hits_cols)) \
-                    .to_excel(writer, sheet_name="all_hits", index=False)
-            os.replace(tmp, path)
-            return
-        except PermissionError as e:
-            last_err = e
-            try:
-                if os.path.exists(tmp): os.remove(tmp)
-            except Exception:
-                pass
-            time.sleep(base_sleep * (2 ** i))
-    fallback = os.path.join(os.path.dirname(path),
-                            f"{os.path.splitext(os.path.basename(path))[0]}_{int(time.time())}.xlsx")
-    try:
-        with pd.ExcelWriter(fallback) as writer:
-            cleaned_df[cleaned_cols].to_excel(writer, sheet_name="cleaned", index=False)
-            (all_hits_df[all_hits_cols] if not all_hits_df.empty else pd.DataFrame(columns=all_hits_cols)) \
-                .to_excel(writer, sheet_name="all_hits", index=False)
-        print(f"! Could not overwrite locked file. Wrote fallback: {fallback}")
-        return
-    except Exception:
-        pass
-    raise last_err or PermissionError(f"Could not write {path}")
-
-
-# -----------------------
-# Main - OPTIMIZED (COMPLETE)
-# -----------------------
-def run(input_csv: str, outdir: str, include_nearby: bool, rps: float,
-        concurrency: int, gpt_workers: int, gpt_rps: float, gpt_burst: int,
-        kw_mode: str, kw_target: int, max_gpt_new: int, log_hits: bool, 
-        log_limit: int, batch_size: int):
-    if not API_KEY:
-        print("ERROR: Set GOOGLE_MAPS_API_KEY environment variable.", file=sys.stderr)
-        sys.exit(2)
-    os.makedirs(outdir, exist_ok=True)
-
-    df = pd.read_csv(input_csv)
-    cols = {c.lower(): c for c in df.columns}
-    if "msi_name" not in cols:
-        if "name" in cols: df.rename(columns={cols["name"]:"msi_name"}, inplace=True)
-        else: raise ValueError("Input must include 'msi_name' or 'name' column")
-    if "lat" not in cols: raise ValueError("Input must include 'lat' column")
-    if not (("lon" in cols) or ("lng" in cols) or ("longitude" in cols)):
-        raise ValueError("Input must include 'lon' or 'lng' or 'longitude' column")
-    if "lon" not in df.columns:
-        if "lng" in df.columns: df.rename(columns={"lng":"lon"}, inplace=True)
-        elif "longitude" in df.columns: df.rename(columns={"longitude":"lon"}, inplace=True)
-
-    results_rows: List[dict] = []
-    all_hits_rows: List[dict] = []
-    totals = dict(kept=0, drop_type=0, drop_self=0, drop_far=0)
-
-    eff_rps = max(0.2, rps / max(1, int(concurrency * 1.5)))
-
-    # Parallel branch processing with progress tracking
-    print(f"\n🔍 Starting competitor search for {len(df)} locations...")
-    print(f"   🔧 Using {concurrency} parallel workers at {eff_rps:.1f} RPS each")
-    
-    futures = []
-    start_time = time.time()
-    
-    with ThreadPoolExecutor(max_workers=concurrency) as ex:
-        for _, row in df.iterrows():
-            futures.append(ex.submit(process_branch, row, include_nearby, eff_rps, kw_mode, kw_target))
-
-        completed = 0
-        for fut in tqdm(
-            as_completed(futures),
-            total=len(futures),
-            desc="🔍 Searching locations",
-            unit="location",
-            dynamic_ncols=True,
-            mininterval=1.0,
-            leave=True,
-            disable=False
-        ):
-            kept_rows, hits_rows, counters = fut.result()
-            results_rows.extend(kept_rows)
-            all_hits_rows.extend(hits_rows)
-            for k, v in counters.items():
-                totals[k] = totals.get(k, 0) + v
-            
-            completed += 1
-            if completed % 5 == 0 or completed == len(futures):
-                elapsed = time.time() - start_time
-                rate = completed / elapsed * 60 if elapsed > 0 else 0
-                print(f"   📊 Processed {completed}/{len(futures)} locations | "
-                      f"Found {totals.get('kept', 0)} competitors | Rate: {rate:.1f}/min")
-    
-    search_time = time.time() - start_time
-    print(f"   ✅ Location search completed in {search_time/60:.1f} minutes")
-
-    # file paths
-    details_path = os.path.join(outdir, "competitors_details.csv")
-    allhits_path = os.path.join(outdir, "competitors_all_hits.csv")
-    xlsx_path = os.path.join(outdir, "competitors_outputs.xlsx")
-    cache_path = os.path.join(outdir, "gpt_cache.json")
-
-    # If nothing found, write empty files
-    cleaned_cols = [
-        "msi_name","msi_lat","msi_lon","place_id","resource_name","name","address","lat","lon",
-        "distance_mi","primary_type","types","website","rating","userRatingCount",
-        # Service type classifications
-        "scaffolding_label","scaffolding_confidence","scaffolding_keywords","scaffolding_evidence",
-        "forming_shoring_label","forming_shoring_confidence","forming_shoring_keywords","forming_shoring_evidence",
-        "insulation_label","insulation_confidence","insulation_keywords","insulation_evidence",
-        "motorized_label","motorized_confidence","motorized_keywords","motorized_evidence",
-        "painting_label","painting_confidence","painting_keywords","painting_evidence",
-        "specialty_label","specialty_confidence","specialty_keywords","specialty_evidence",
-        # Size classification
-        "size_bucket","size_confidence","size_evidence"
-    ]
-    all_hits_cols = [
-        "msi_name","msi_lat","msi_lon","place_id","resource_name","name","address","lat","lon",
-        "distance_mi","primary_type","types","website","rating","userRatingCount","source","matched_keyword",
-        "drop_reason","kept_final",
-        # Service type classifications
-        "scaffolding_label","scaffolding_confidence","scaffolding_keywords","scaffolding_evidence",
-        "forming_shoring_label","forming_shoring_confidence","forming_shoring_keywords","forming_shoring_evidence",
-        "insulation_label","insulation_confidence","insulation_keywords","insulation_evidence",
-        "motorized_label","motorized_confidence","motorized_keywords","motorized_evidence",
-        "painting_label","painting_confidence","painting_keywords","painting_evidence",
-        "specialty_label","specialty_confidence","specialty_keywords","specialty_evidence",
-        # Size classification
-        "size_bucket","size_confidence","size_evidence"
-    ]
-
-    if not results_rows and not all_hits_rows:
-        safe_to_csv(pd.DataFrame(columns=cleaned_cols), details_path)
-        safe_to_csv(pd.DataFrame(columns=all_hits_cols), allhits_path)
-        try:
-            safe_to_xlsx(pd.DataFrame(columns=cleaned_cols),
-                        pd.DataFrame(columns=all_hits_cols),
-                        xlsx_path, cleaned_cols, all_hits_cols)
+            self._data = json.loads(self._path.read_text(encoding="utf-8"))
         except Exception:
-            pass
+            logging.warning("Failed to read cache file; starting with empty cache: %s", self._path)
+            self._data = {}
 
-        print(f"\nNo results. Wrote empty files:\n  - {details_path}\n  - {allhits_path}\n  - {xlsx_path}")
-        return details_path
+    def get(self, key: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            entry = self._data.get(key)
+            if not entry:
+                return None
+            if self._ttl_seconds:
+                ts = float(entry.get("ts", 0.0))
+                if (time.time() - ts) > self._ttl_seconds:
+                    return None
+            return entry.get("value")
 
-    # -----------------------
-    # AI labeling (kept rows only) with website facts + GPT (async if available) - OPTIMIZED
-    # -----------------------
-    cache = load_cache(cache_path)
-    sync_client, async_client = get_openai_clients()
+    def set(self, key: str, value: Dict[str, Any]) -> None:
+        with self._lock:
+            self._data[key] = {"ts": time.time(), "value": value}
+            self._dirty = True
 
-    # Initialize GPT tracker
-    gpt_tracker = GPTCallTracker()
-    print("🤖 Initializing GPT Call Tracker...")
+    def save(self) -> None:
+        with self._lock:
+            if not self._dirty:
+                return
+            safe_json_dump(self._path, self._data)
+            self._dirty = False
 
-    # Build unique places dict (fast processing - no website scraping)
-    uniq_by_place: Dict[str, dict] = {}
-    facts_by_place: Dict[str, dict] = {}
 
-    print(f"📊 Processing {len(results_rows)} results into {len(set(r['place_id'] for r in results_rows))} unique companies...")
-    
-    for r in results_rows:
-        pid = r["place_id"]
-        if pid not in uniq_by_place:
-            uniq_by_place[pid] = {
-                "place_id": pid,
-                "name": r.get("name",""),
-                "address": r.get("address",""),
-                "primary_type": r.get("primary_type",""),
-                "types": r.get("types",""),
-                "website": r.get("website",""),
-                "rating": r.get("rating"),
-                "userRatingCount": r.get("userRatingCount"),
-            }
-            # Use empty facts for maximum speed
-            facts_by_place[pid] = {
-                "homepage_text": "", "pages_fetched": 0, "employees": None, 
-                "states_count": 0, "nationwide": False, "hiring": False, "has_linkedin": False
-            }
-    
-    print(f"   ✅ Prepared {len(uniq_by_place)} unique companies for classification")
+# ---------------------------- Google Places Client ---------------------------- #
 
-    # Prelabel with fast rule (skips GPT on obvious cases)
-    print(f"⚡ Running fast keyword detection...")
-    fast_rule_count = 0
-    for pid, pdata in uniq_by_place.items():
-        if pid in cache:
-            gpt_tracker.log_call("cached", True)
-            continue
-        fr = fast_rule_label_enhanced(pdata)
-        if fr:
-            gpt_tracker.log_call("fast_rule", True)
-            cache[pid] = fr
-            fast_rule_count += 1
-    
-    print(f"   ✅ Fast rules classified {fast_rule_count} companies, cached: {gpt_tracker.cached_calls}")
 
-    to_classify = [pid for pid in uniq_by_place if pid not in cache]
-    if max_gpt_new and len(to_classify) > max_gpt_new:
-        to_classify = to_classify[:max_gpt_new]
+class PlacesClient:
+    def __init__(
+        self,
+        api_key: str,
+        calls_per_second: float,
+        radius_miles: float,
+        timeout_s: int = 30,
+        max_retries: int = 4,
+    ):
+        self._api_key = api_key
+        self._limiter = RateLimiter(calls_per_second)
+        self._radius_meters = int(radius_miles * METERS_PER_MILE)
+        self._timeout_s = timeout_s
+        self._max_retries = max_retries
+        self._local = threading.local()
 
-    print(f"\n🚀 Starting GPT-4o processing for {len(to_classify)} places...")
-    print(f"   📊 Cache hits: {gpt_tracker.cached_calls}, Fast rules: {gpt_tracker.fast_rule_calls}")
-    
-    if len(to_classify) > 0:
-        estimated_time = (len(to_classify) / gpt_rps) * 1.2  # Add 20% buffer
-        print(f"   ⏱️  Estimated completion: {estimated_time/60:.1f} minutes at {gpt_rps} RPS")
+    def _session(self) -> requests.Session:
+        if getattr(self._local, "session", None) is None:
+            self._local.session = requests.Session()
+        return self._local.session
 
-    if to_classify:
-        if async_client is not None:
-            # OPTIMIZATION: Use rate limiter for async batch processing
-            rate_limiter = AsyncRateLimiter(gpt_rps, gpt_burst)
-            print(f"   🔧 Using async GPT processing: {gpt_rps} RPS, {gpt_workers} workers, burst {gpt_burst}")
-            
-            start_time = time.time()
-            labels = asyncio.run(
-                classify_batch_async(async_client, GPT_MODEL, to_classify,
-                                    uniq_by_place, facts_by_place, rate_limiter, gpt_tracker,
-                                    max_concurrency=max(1, int(gpt_workers)))
-            )
-            actual_time = time.time() - start_time
-            print(f"   ✅ GPT processing completed in {actual_time/60:.1f} minutes")
-            cache.update(labels)
-        elif sync_client is not None:
-            # Fallback: sync, in a thread pool
-            def gpt_task(pid):
-                pdata = uniq_by_place[pid]
-                facts = facts_by_place.get(pid, {})
-                return pid, classify_with_gpt(sync_client, pdata, facts)
-            with ThreadPoolExecutor(max_workers=max(1, int(gpt_workers))) as ex:
-                for pid, label in ex.map(gpt_task, to_classify):
-                    cache[pid] = label
-        else:
-            # No OpenAI configured → heuristic only for size
-            for pid in to_classify:
-                h = heuristic_size_from_facts(facts_by_place.get(pid, {})) \
-                    or {"size_bucket":"Unknown","size_confidence":0.0,"size_evidence":"no data"}
-                
-                result = {
-                    "size_bucket":h["size_bucket"],"size_confidence":h["size_confidence"],"size_evidence":h["size_evidence"]
-                }
-                
-                # Add all service types as Unknown
-                service_types = ["scaffolding", "forming_shoring", "insulation", "motorized", "painting", "specialty"]
-                for service_type in service_types:
-                    result[f"{service_type}_label"] = "Unknown"
-                    result[f"{service_type}_confidence"] = 0.0
-                    result[f"{service_type}_keywords"] = "no_openai_client"
-                    result[f"{service_type}_evidence"] = "no_openai_client"
-                
-                cache[pid] = result
-
-    save_cache(cache_path, cache)
-
-    # Attach AI to kept rows
-    enriched_rows: List[dict] = []
-    printed = 0
-    for r in results_rows:
-        ai = cache.get(r["place_id"], {})
-        
-        # Default values for all service types
-        default_ai = {
-            "size_bucket":"Unknown","size_confidence":0.0,"size_evidence":"not_labeled"
+    def _headers(self) -> Dict[str, str]:
+        return {
+            "Content-Type": "application/json",
+            "X-Goog-Api-Key": self._api_key,
+            "X-Goog-FieldMask": PLACES_FIELDS,
         }
-        service_types = ["scaffolding", "forming_shoring", "insulation", "motorized", "painting", "specialty"]
-        for service_type in service_types:
-            default_ai[f"{service_type}_label"] = "Unknown"
-            default_ai[f"{service_type}_confidence"] = 0.0
-            default_ai[f"{service_type}_keywords"] = "not_labeled"
-            default_ai[f"{service_type}_evidence"] = "not_labeled"
-        
-        # Merge with actual AI results
-        for key, default_value in default_ai.items():
-            if key not in ai:
-                ai[key] = default_value
-        
-        r2 = dict(r)
-        
-        # Add all service type columns
-        for service_type in service_types:
-            r2[f"{service_type}_label"] = ai.get(f"{service_type}_label", "Unknown")
-            r2[f"{service_type}_confidence"] = ai.get(f"{service_type}_confidence", 0.0)
-            r2[f"{service_type}_keywords"] = ai.get(f"{service_type}_keywords", "")
-            r2[f"{service_type}_evidence"] = ai.get(f"{service_type}_evidence", "")
-        
-        # Add size columns
-        r2.update({
-            "size_bucket": ai.get("size_bucket","Unknown"),
-            "size_confidence": ai.get("size_confidence",0.0),
-            "size_evidence": ai.get("size_evidence",""),
-        })
-        
-        enriched_rows.append(r2)
-        if log_hits and (log_limit == 0 or printed < log_limit):
-            # Show all detected service types in log
-            services = []
-            for service_type in service_types:
-                if r2.get(f"{service_type}_label") == "Yes":
-                    services.append(service_type.replace("_", "/").title())
-            services_str = ",".join(services) if services else "None"
-            pwrite(f"[{r['msi_name']}] + {r['name']}  ({r['distance_mi']} mi)  "
-                f"Services={services_str}  Size={r2['size_bucket']}")
-            printed += 1
 
-    # CLEANED sheet
-    cleaned_df = pd.DataFrame(enriched_rows).sort_values(["msi_name", "distance_mi"])
-    safe_to_csv(cleaned_df, details_path)
+    def _post(self, url: str, body: Dict[str, Any]) -> Dict[str, Any]:
+        """POST with retry/backoff on transient errors."""
 
-    # ALL-HITS (AI columns only for kept rows)
-    all_hits_df = pd.DataFrame(all_hits_rows)
+        backoff = 1.0
+        for attempt in range(self._max_retries):
+            self._limiter.wait()
+            try:
+                resp = self._session().post(url, headers=self._headers(), json=body, timeout=self._timeout_s)
+                if resp.status_code in (429, 500, 502, 503, 504):
+                    raise requests.HTTPError(f"HTTP {resp.status_code}: {resp.text[:200]}")
+                resp.raise_for_status()
+                return resp.json()
+            except Exception as e:
+                if attempt == self._max_retries - 1:
+                    raise
+                logging.warning("Places request failed (attempt %s/%s): %s", attempt + 1, self._max_retries, e)
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 10.0)
+        raise RuntimeError("Unreachable")
 
-    if not all_hits_df.empty:
-        ai_cols = [
-            "place_id",
-            # Service type classifications
-            "scaffolding_label","scaffolding_confidence","scaffolding_keywords","scaffolding_evidence",
-            "forming_shoring_label","forming_shoring_confidence","forming_shoring_keywords","forming_shoring_evidence",
-            "insulation_label","insulation_confidence","insulation_keywords","insulation_evidence",
-            "motorized_label","motorized_confidence","motorized_keywords","motorized_evidence",
-            "painting_label","painting_confidence","painting_keywords","painting_evidence",
-            "specialty_label","specialty_confidence","specialty_keywords","specialty_evidence",
-            # Size classification
-            "size_bucket", "size_confidence", "size_evidence"
+    def search_text(self, lat: float, lon: float, query: str) -> List[Dict[str, Any]]:
+        body = {
+            "textQuery": query,
+            "locationRestriction": {
+                "circle": {
+                    "center": {"latitude": lat, "longitude": lon},
+                    "radius": self._radius_meters,
+                }
+            },
+        }
+        return self._post(PLACES_TEXT_URL, body).get("places", [])
+
+    def search_nearby(self, lat: float, lon: float, included_types: List[str]) -> List[Dict[str, Any]]:
+        body = {
+            "includedTypes": included_types,
+            "locationRestriction": {
+                "circle": {
+                    "center": {"latitude": lat, "longitude": lon},
+                    "radius": self._radius_meters,
+                }
+            },
+        }
+        return self._post(PLACES_NEARBY_URL, body).get("places", [])
+
+
+# ---------------------------- OpenAI Enrichment ---------------------------- #
+
+
+def _extract_output_text(response: Any) -> str:
+    """Robustly extract text output from an OpenAI Responses API object."""
+
+    if hasattr(response, "output_text"):
+        return response.output_text  # type: ignore[attr-defined]
+
+    # Fallback: walk the response.output structure
+    parts: List[str] = []
+    for item in getattr(response, "output", []) or []:
+        if getattr(item, "type", None) != "message":
+            continue
+        for content in getattr(item, "content", []) or []:
+            if getattr(content, "type", None) in ("output_text", "text"):
+                parts.append(getattr(content, "text", ""))
+    return "".join(parts)
+
+
+class OpenAIEnricher:
+    """Enriches companies using Responses API + web_search, with throttling and caching."""
+
+    def __init__(
+        self,
+        api_key: str,
+        base_url: str,
+        model: str,
+        calls_per_second: float,
+        max_in_flight: int,
+        cache: JsonCache,
+        batch_size: int = 1,
+        max_retries: int = 3,
+    ):
+        self._api_key = api_key
+        self._base_url = base_url
+        self._model = model
+        self._limiter = RateLimiter(calls_per_second)
+        self._sema = threading.BoundedSemaphore(max_in_flight)
+        self._cache = cache
+        self._batch_size = max(1, batch_size)
+        self._max_retries = max_retries
+        self._local = threading.local()
+
+    def _client(self) -> Any:
+        if getattr(self._local, "client", None) is None:
+            self._local.client = openai.OpenAI(api_key=self._api_key, base_url=self._base_url)
+        return self._local.client
+
+    @staticmethod
+    def _single_schema() -> Dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "is_competitor": {"type": "boolean"},
+                "size_bucket": {
+                    "type": "string",
+                    "enum": ["Micro", "Small", "Mid", "Large", "Enterprise", "Unknown"],
+                },
+                "employee_estimate": {"type": "string"},
+                "service_offerings": {
+                    "type": "object",
+                    "properties": {
+                        "scaffolding": {"type": "boolean"},
+                        "forming_shoring": {"type": "boolean"},
+                        "industrial_insulation": {"type": "boolean"},
+                        "coatings_painting": {"type": "boolean"},
+                        "motorized_access": {"type": "boolean"},
+                    },
+                    "required": [
+                        "scaffolding",
+                        "forming_shoring",
+                        "industrial_insulation",
+                        "coatings_painting",
+                        "motorized_access",
+                    ],
+                },
+                "summary": {"type": "string"},
+                "top_sources": {"type": "array", "items": {"type": "string"}},
+                "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+            },
+            "required": ["is_competitor", "size_bucket", "service_offerings", "confidence"],
+        }
+
+    @staticmethod
+    def _batch_schema() -> Dict[str, Any]:
+        item = OpenAIEnricher._single_schema()
+        item = {"type": "object", "properties": {"place_id": {"type": "string"}, **item["properties"]},
+                "required": ["place_id", *item["required"]]}
+        return {
+            "type": "object",
+            "properties": {"results": {"type": "array", "items": item}},
+            "required": ["results"],
+        }
+
+    def get_cached(self, place_id: str) -> Optional[Dict[str, Any]]:
+        return self._cache.get(place_id)
+
+    def enrich_missing(self, places: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+        """Enrich a list of places (dicts with place_id/name/website/address). Uses batching if configured."""
+
+        missing: List[Dict[str, Any]] = []
+        results: Dict[str, Dict[str, Any]] = {}
+
+        for p in places:
+            pid = p["place_id"]
+            cached = self.get_cached(pid)
+            if cached is not None:
+                results[pid] = cached
+            else:
+                missing.append(p)
+
+        if not missing:
+            return results
+
+        if self._batch_size <= 1:
+            for p in missing:
+                results[p["place_id"]] = self._enrich_one_with_retry(p)
+        else:
+            for batch in chunked(missing, self._batch_size):
+                batch_results = self._enrich_batch_with_retry(batch)
+                for pid, val in batch_results.items():
+                    results[pid] = val
+
+        return results
+
+    def _enrich_one_with_retry(self, place: Dict[str, Any]) -> Dict[str, Any]:
+        backoff = 1.0
+        for attempt in range(self._max_retries):
+            try:
+                return self._enrich_one(place)
+            except Exception as e:
+                if attempt == self._max_retries - 1:
+                    logging.error("OpenAI enrichment failed for %s: %s", place.get("place_id"), e)
+                    break
+                logging.warning("OpenAI enrichment retry for %s (attempt %s/%s): %s", place.get("place_id"), attempt + 1, self._max_retries, e)
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 10.0)
+
+        # Fallback on hard failure
+        fallback = {
+            "is_competitor": False,
+            "size_bucket": "Unknown",
+            "employee_estimate": "",
+            "service_offerings": {
+                "scaffolding": False,
+                "forming_shoring": False,
+                "industrial_insulation": False,
+                "coatings_painting": False,
+                "motorized_access": False,
+            },
+            "summary": "",
+            "top_sources": [],
+            "confidence": 0.0,
+        }
+        self._cache.set(place["place_id"], fallback)
+        return fallback
+
+    def _enrich_batch_with_retry(self, places: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+        backoff = 1.0
+        for attempt in range(self._max_retries):
+            try:
+                return self._enrich_batch(places)
+            except Exception as e:
+                if attempt == self._max_retries - 1:
+                    logging.error("OpenAI batch enrichment failed (size=%s): %s", len(places), e)
+                    break
+                logging.warning(
+                    "OpenAI batch enrichment retry (attempt %s/%s, size=%s): %s",
+                    attempt + 1,
+                    self._max_retries,
+                    len(places),
+                    e,
+                )
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 10.0)
+
+        # Fallback for batch
+        out: Dict[str, Dict[str, Any]] = {}
+        for p in places:
+            out[p["place_id"]] = {
+                "is_competitor": False,
+                "size_bucket": "Unknown",
+                "employee_estimate": "",
+                "service_offerings": {
+                    "scaffolding": False,
+                    "forming_shoring": False,
+                    "industrial_insulation": False,
+                    "coatings_painting": False,
+                    "motorized_access": False,
+                },
+                "summary": "",
+                "top_sources": [],
+                "confidence": 0.0,
+            }
+            self._cache.set(p["place_id"], out[p["place_id"]])
+        return out
+
+    def _enrich_one(self, place: Dict[str, Any]) -> Dict[str, Any]:
+        pid = place["place_id"]
+        name = place.get("company_name", "")
+        website = place.get("website", "")
+        address = place.get("address", "")
+
+        prompt = (
+            f"Company: {name}\n"
+            f"Website: {website or 'N/A'}\n"
+            f"Address: {address or 'N/A'}\n\n"
+            "Task:\n"
+            "1) Determine if this company competes with BrandSafway in access/scaffolding or related services.\n"
+            "2) Determine company size bucket and (if possible) an employee range estimate.\n"
+            "3) Mark which services they offer:\n"
+            "   - Scaffolding\n"
+            "   - Forming/Shoring\n"
+            "   - Industrial Insulation\n"
+            "   - Coatings/Painting\n"
+            "   - Motorized Access\n\n"
+            "Guidelines:\n"
+            "- Use web search. Prefer the company's site, reputable directories, or industry sources.\n"
+            "- If you cannot verify, mark Unknown/False and lower confidence.\n"
+            "- Provide a 1-2 sentence summary and up to 3 source URLs.\n"
+        )
+
+        with self._sema:
+            self._limiter.wait()
+            response = self._client().responses.create(
+                model=self._model,
+                tools=[{"type": "web_search"}],
+                include=["web_search_call.action.sources"],
+                instructions=SYSTEM_PROMPT,
+                input=prompt,
+                text={
+                    "format": {
+                        "type": "json_schema",
+                        "name": "company_profile",
+                        "schema": self._single_schema(),
+                        "strict": True,
+                    }
+                },
+            )
+
+        data = json.loads(_extract_output_text(response))
+        self._cache.set(pid, data)
+        return data
+
+    def _enrich_batch(self, places: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+        """Batch enrichment: multiple companies per OpenAI call (optional)."""
+
+        companies_payload = [
+            {
+                "place_id": p["place_id"],
+                "company_name": p.get("company_name", ""),
+                "website": p.get("website", ""),
+                "address": p.get("address", ""),
+            }
+            for p in places
         ]
 
-        # Ensure AI columns exist on cleaned_df (safety)
-        for c in ai_cols:
-            if c not in cleaned_df.columns:
-                cleaned_df[c] = ""
-
-        join_df = cleaned_df[ai_cols].drop_duplicates("place_id")
-        all_hits_df = all_hits_df.merge(join_df, on="place_id", how="left")
-
-        # Ensure required columns exist before ordering
-        missing = [c for c in all_hits_cols if c not in all_hits_df.columns]
-        for c in missing:
-            all_hits_df[c] = ""
-
-        all_hits_df = all_hits_df[all_hits_cols]
-        all_hits_df.sort_values(
-            ["msi_name", "kept_final", "distance_mi"],
-            ascending=[True, False, True],
-            inplace=True
+        prompt = (
+            "You will be given a JSON list of companies. For EACH company, use web search to determine: "
+            "(a) whether it competes with BrandSafway, (b) size bucket and employee estimate if possible, "
+            "(c) whether it offers: scaffolding, forming/shoring, industrial insulation, coatings/painting, motorized access. "
+            "Return results as an array with one item per input company, preserving place_id. "
+            "Limit sources to up to 3 URLs per company.\n\n"
+            f"INPUT_COMPANIES_JSON:\n{json.dumps(companies_payload, ensure_ascii=False)}"
         )
 
-        safe_to_csv(all_hits_df, allhits_path)
-    else:
-        # make sure the variable exists with the right schema for the XLSX write
-        all_hits_df = pd.DataFrame(columns=all_hits_cols)
-        safe_to_csv(all_hits_df, allhits_path)
+        with self._sema:
+            self._limiter.wait()
+            response = self._client().responses.create(
+                model=self._model,
+                tools=[{"type": "web_search"}],
+                include=["web_search_call.action.sources"],
+                instructions=SYSTEM_PROMPT,
+                input=prompt,
+                text={
+                    "format": {
+                        "type": "json_schema",
+                        "name": "company_profile_batch",
+                        "schema": self._batch_schema(),
+                        "strict": True,
+                    }
+                },
+            )
 
-    # XLSX (2 tabs) — uses safe writer and the actual dataframes built above
-    try:
-        safe_to_xlsx(cleaned_df, all_hits_df, xlsx_path, cleaned_cols, all_hits_cols)
-    except Exception as e:
-        print(f"! Could not write Excel workbook ({e}). CSVs were written instead.")
+        payload = json.loads(_extract_output_text(response))
+        out: Dict[str, Dict[str, Any]] = {}
 
-    # Summary
-    print("\nSummary")
-    print("-------")
-    print(f"Kept: {totals['kept']}, Dropped by type: {totals['drop_type']}, Self-brand: {totals['drop_self']}, >30mi: {totals['drop_far']}")
-    print(f"Wrote:\n  - {details_path}\n  - {allhits_path}\n  - {xlsx_path}\n  - cache: {cache_path}")
+        for item in payload.get("results", []) or []:
+            pid = item.get("place_id")
+            if not pid:
+                continue
+            # Remove place_id from cached value to keep cache compact
+            value = {k: v for k, v in item.items() if k != "place_id"}
+            self._cache.set(pid, value)
+            out[pid] = value
 
-    # Print final GPT statistics
-    print("\n" + "="*60)
-    print("🤖 FINAL GPT STATISTICS")
-    print("="*60)
-    final_stats = gpt_tracker.get_stats()
-    print(f"⏱️  Total Time: {final_stats['elapsed_time']:.1f} seconds")
-    print(f"📊 Total Calls: {final_stats['total_calls']}")
-    print(f"✅ Successful: {final_stats['successful_calls']}")
-    print(f"❌ Failed: {final_stats['failed_calls']}")
-    print(f"💾 Cached: {final_stats['cached_calls']}")
-    print(f"⚡ Fast Rules: {final_stats['fast_rule_calls']}")
-    print(f"🔄 Batch Calls: {final_stats['batch_calls']}")
-    print(f" Success Rate: {final_stats['success_rate']:.1f}%")
-    print(f"⚡ Speed: {final_stats['calls_per_minute']:.1f} calls/minute")
-    print(f"💰 Total Cost: ${final_stats['total_cost']:.4f}")
-    print(f" Total Tokens: {final_stats['total_tokens']:,}")
-    if final_stats['error_counts']:
-        print(f"❌ Error Breakdown: {final_stats['error_counts']}")
-    print("="*60)
-    
-    return details_path
+        # Ensure every input has an output
+        for p in places:
+            pid = p["place_id"]
+            if pid not in out:
+                out[pid] = self._cache.get(pid) or {
+                    "is_competitor": False,
+                    "size_bucket": "Unknown",
+                    "employee_estimate": "",
+                    "service_offerings": {
+                        "scaffolding": False,
+                        "forming_shoring": False,
+                        "industrial_insulation": False,
+                        "coatings_painting": False,
+                        "motorized_access": False,
+                    },
+                    "summary": "",
+                    "top_sources": [],
+                    "confidence": 0.0,
+                }
+        return out
 
-# -----------------------
-# Entrypoint
-# -----------------------
-if __name__ == "__main__":
-    args = parse_args()
-    run(
-        input_csv=args.input,
-        outdir=args.outdir,
-        include_nearby=args.include_nearby,
-        rps=args.rps,
-        concurrency=int(args.concurrency),
-        gpt_workers=int(args.gpt_workers),
-        gpt_rps=float(args.gpt_rps),
-        gpt_burst=int(args.gpt_burst),
-        kw_mode=args.kw_mode,
-        kw_target=int(args.kw_target),
-        max_gpt_new=int(args.max_gpt) if args.max_gpt is not None else 0,
-        log_hits=args.log_hits,
-        log_limit=int(args.log_limit) if args.log_limit is not None else 0,
-        batch_size=int(args.batch_size),
+
+# ---------------------------- Competitor Discovery ---------------------------- #
+
+
+def is_blocked(place: Dict[str, Any]) -> bool:
+    """Fast filter for obvious non-competitors."""
+
+    types = set(place.get("types") or [])
+    if types & BLOCK_TYPES:
+        return True
+
+    name = normalize_text(((place.get("displayName") or {}).get("text") or ""))
+    if any(sub in name for sub in EXCLUDE_NAME_SUBSTRINGS):
+        return True
+
+    return False
+
+
+# ---------------------------- Prefilter (Cost Control) ---------------------------- #
+
+# The OpenAI web_search enrichment step is the primary cost driver. This lightweight
+# prefilter reduces cost by skipping enrichment for low-signal candidates.
+#
+# Design goals:
+# - Conservative: avoid filtering out true competitors.
+# - Explainable: produce a simple score + reasons for auditing.
+# - Cheap: pure string/type heuristics (no external calls).
+
+DEFAULT_PREFILTER_MIN_SCORE = 2
+
+# Strong service hints that frequently indicate BrandSafway-like competitors.
+PREFILTER_STRONG_TERMS = {
+    "scaffold",
+    "scaffolding",
+    "swing stage",
+    "swingstage",
+    "mast climber",
+    "mastclimber",
+    "shoring",
+    "forming",
+    "formwork",
+    "temporary access",
+    "access solutions",
+    "work platform",
+    "work platforms",
+    "motorized access",
+    "industrial insulation",
+    "insulation",
+    "fireproofing",
+    "coatings",
+    "coating",
+    "protective coating",
+    "protective coatings",
+    "abrasive blasting",
+    "sandblasting",
+}
+
+# Context terms that can support the strong terms (weak signal by themselves).
+PREFILTER_CONTEXT_TERMS = {
+    "industrial",
+    "commercial",
+    "contractor",
+    "construction",
+    "rental",
+    "rentals",
+    "equipment",
+    "services",
+    "plant",
+    "refinery",
+}
+
+# Trade terms that usually indicate *non-competitors* (negative weight). Keep this
+# list modest to avoid false negatives.
+PREFILTER_NEGATIVE_TERMS = {
+    "plumbing",
+    "plumber",
+    "electric",
+    "electrical",
+    "hvac",
+    "landscaping",
+    "lawn",
+    "roofing",
+    "roofer",
+    "paving",
+    "asphalt",
+    "concrete",
+    "flooring",
+    "carpet",
+    "fencing",
+    "window",
+    "windows",
+    "door",
+    "doors",
+    "kitchen",
+    "bath",
+    "residential",
+}
+
+# Place types that can indicate relevance. These are intentionally broad; the score
+# threshold controls whether they are enough to trigger enrichment.
+PREFILTER_RELEVANT_TYPES = {
+    "equipment_rental_agency",
+    "general_contractor",
+    "construction_company",
+    "industrial_equipment_supplier",
+}
+
+
+def _as_type_set(types_val: Any) -> set:
+    """Normalize a Places `types` value into a set[str]."""
+
+    if types_val is None:
+        return set()
+    if isinstance(types_val, list):
+        return {str(t).strip() for t in types_val if str(t).strip()}
+    if isinstance(types_val, str):
+        return {t.strip() for t in types_val.split(",") if t.strip()}
+    return {str(types_val).strip()} if str(types_val).strip() else set()
+
+
+def prefilter_score(place_payload: Dict[str, Any]) -> Tuple[int, List[str]]:
+    """Compute a cheap relevance score for a potential competitor.
+
+    Returns:
+        (score, reasons)
+
+    Scoring (conservative):
+      +3 per strong service hint (capped at 2 hits)
+      +1 per context term (capped at 2 hits)
+      +1 if any relevant place type is present
+      -2 if any negative trade hint is present (capped at 1 hit)
+
+    The intent is not perfect classification; it is a cost-control gate that
+    filters only low-signal items.
+    """
+
+    name = normalize_text(place_payload.get("company_name") or "")
+    website = normalize_text(place_payload.get("website") or "")
+    address = normalize_text(place_payload.get("address") or "")
+    primary_type = normalize_text(place_payload.get("primary_type") or "")
+
+    types_set = _as_type_set(place_payload.get("types"))
+
+    haystack = " ".join([name, website, address, primary_type, " ".join(sorted(types_set))])
+
+    score = 0
+    reasons: List[str] = []
+
+    strong_hits = [t for t in PREFILTER_STRONG_TERMS if t in haystack]
+    if strong_hits:
+        # cap to avoid huge scores from repeated tokens
+        hits = strong_hits[:2]
+        score += 3 * len(hits)
+        reasons.append(f"strong={','.join(hits)}")
+
+    ctx_hits = [t for t in PREFILTER_CONTEXT_TERMS if t in haystack]
+    if ctx_hits:
+        hits = ctx_hits[:2]
+        score += 1 * len(hits)
+        reasons.append(f"context={','.join(hits)}")
+
+    if types_set & PREFILTER_RELEVANT_TYPES:
+        score += 1
+        reasons.append(f"types={','.join(sorted(types_set & PREFILTER_RELEVANT_TYPES))}")
+
+    neg_hits = [t for t in PREFILTER_NEGATIVE_TERMS if t in haystack]
+    if neg_hits:
+        score -= 2
+        reasons.append(f"negative={neg_hits[0]}")
+
+    if not reasons:
+        reasons.append("no_signals")
+
+    return score, reasons
+
+
+def prefilter_fallback(score: int, reasons: List[str], min_score: int) -> Dict[str, Any]:
+    """Fallback enrichment record for prefiltered-out items."""
+
+    reason_str = ";".join(reasons[:3])
+    return {
+        "is_competitor": False,
+        "size_bucket": "Unknown",
+        "employee_estimate": "",
+        "service_offerings": {
+            "scaffolding": False,
+            "forming_shoring": False,
+            "industrial_insulation": False,
+            "coatings_painting": False,
+            "motorized_access": False,
+        },
+        "summary": f"Prefilter skipped enrichment (score={score} < {min_score}). Reasons: {reason_str}.",
+        "top_sources": [],
+        "confidence": 0.0,
+    }
+
+
+def place_to_candidate(branch: Branch, place: Dict[str, Any], radius_miles: float) -> Optional[PlaceCandidate]:
+    place_id = place.get("id")
+    if not place_id:
+        return None
+
+    loc = place.get("location") or {}
+    plat = loc.get("latitude")
+    plon = loc.get("longitude")
+    if plat is None or plon is None:
+        return None
+
+    dist = haversine_miles(branch.latitude, branch.longitude, float(plat), float(plon))
+    if dist > radius_miles:
+        return None
+
+    name = ((place.get("displayName") or {}).get("text") or "").strip()
+    address = (place.get("formattedAddress") or "").strip()
+
+    return PlaceCandidate(
+        branch_id=branch.branch_id,
+        branch_name=branch.branch_name,
+        branch_latitude=branch.latitude,
+        branch_longitude=branch.longitude,
+        place_id=place_id,
+        company_name=name,
+        address=address,
+        latitude=float(plat),
+        longitude=float(plon),
+        website=(place.get("websiteUri") or "").strip(),
+        primary_type=(place.get("primaryType") or ""),
+        types=",".join(place.get("types") or []),
+        rating=place.get("rating"),
+        user_rating_count=place.get("userRatingCount"),
+        distance_miles=round(dist, 3),
     )
+
+
+def discover_branch_candidates(
+    branch: Branch,
+    places: PlacesClient,
+    keywords: List[str],
+    radius_miles: float,
+    max_candidates_per_branch: Optional[int],
+) -> List[PlaceCandidate]:
+    """Find candidates near a branch via targeted Places searches."""
+
+    discovered: Dict[str, Dict[str, Any]] = {}
+
+    # 1) Keyword text search (tuned for BrandSafway-like competitors)
+    for kw in keywords:
+        try:
+            for p in places.search_text(branch.latitude, branch.longitude, kw):
+                pid = p.get("id")
+                if pid and pid not in discovered:
+                    discovered[pid] = p
+        except Exception as e:
+            logging.warning("Branch %s keyword '%s' search failed: %s", branch.branch_id, kw, e)
+
+    # 2) Nearby type search (broad net; can be noisy but helpful)
+    # Types list can be tuned. Keep modest to avoid too much noise.
+    try:
+        nearby_types = ["equipment_rental_agency", "general_contractor"]
+        for p in places.search_nearby(branch.latitude, branch.longitude, nearby_types):
+            pid = p.get("id")
+            if pid and pid not in discovered:
+                discovered[pid] = p
+    except Exception as e:
+        logging.warning("Branch %s nearby search failed: %s", branch.branch_id, e)
+
+    candidates: List[PlaceCandidate] = []
+    for p in discovered.values():
+        if is_blocked(p):
+            continue
+        cand = place_to_candidate(branch, p, radius_miles)
+        if cand:
+            candidates.append(cand)
+
+    # Sort by proximity (useful for capping)
+    candidates.sort(key=lambda x: x.distance_miles)
+
+    if max_candidates_per_branch and max_candidates_per_branch > 0 and len(candidates) > max_candidates_per_branch:
+        candidates = candidates[:max_candidates_per_branch]
+
+    return candidates
+
+
+# ---------------------------- Outputs & Summaries ---------------------------- #
+
+
+def flatten_enrichment(enrichment: Dict[str, Any]) -> Dict[str, Any]:
+    """Flatten nested enrichment into a single-level dict for CSV."""
+
+    svc = enrichment.get("service_offerings") or {}
+    flat = {
+        "is_competitor": enrichment.get("is_competitor"),
+        "size_bucket": enrichment.get("size_bucket"),
+        "employee_estimate": enrichment.get("employee_estimate", ""),
+        "offers_scaffolding": bool(svc.get("scaffolding")),
+        "offers_forming_shoring": bool(svc.get("forming_shoring")),
+        "offers_industrial_insulation": bool(svc.get("industrial_insulation")),
+        "offers_coatings_painting": bool(svc.get("coatings_painting")),
+        "offers_motorized_access": bool(svc.get("motorized_access")),
+        "summary": enrichment.get("summary", ""),
+        "top_sources": ";".join(enrichment.get("top_sources") or []),
+        "confidence": enrichment.get("confidence"),
+    }
+    return flat
+
+
+def build_branch_summary(df: pd.DataFrame) -> pd.DataFrame:
+    """Create branch-level competitor summary stats."""
+
+    # Focus summary on competitors if the column exists; otherwise include all.
+    if "is_competitor" in df.columns:
+        dfc = df[df["is_competitor"] == True].copy()  # noqa: E712
+    else:
+        dfc = df.copy()
+
+    if dfc.empty:
+        return pd.DataFrame(columns=["branch_id", "branch_name", "competitor_count"])  # empty but valid
+
+    base = (
+        dfc.groupby(["branch_id", "branch_name"], as_index=False)
+        .agg(
+            competitor_count=("place_id", "nunique"),
+            avg_distance_miles=("distance_miles", "mean"),
+            median_distance_miles=("distance_miles", "median"),
+        )
+    )
+
+    # Size bucket counts
+    if "size_bucket" in dfc.columns:
+        size_counts = (
+            dfc.pivot_table(
+                index=["branch_id", "branch_name"],
+                columns="size_bucket",
+                values="place_id",
+                aggfunc="nunique",
+                fill_value=0,
+            )
+            .reset_index()
+        )
+        # Normalize column names
+        size_counts.columns = [
+            ("size_" + str(c).lower().replace(" ", "_") if c not in ("branch_id", "branch_name") else c)
+            for c in size_counts.columns
+        ]
+        base = base.merge(size_counts, on=["branch_id", "branch_name"], how="left")
+
+    # Service counts
+    service_cols = [
+        "offers_scaffolding",
+        "offers_forming_shoring",
+        "offers_industrial_insulation",
+        "offers_coatings_painting",
+        "offers_motorized_access",
+    ]
+    present_service_cols = [c for c in service_cols if c in dfc.columns]
+    if present_service_cols:
+        svc_counts = (
+            dfc.groupby(["branch_id", "branch_name"], as_index=False)[present_service_cols]
+            .sum(numeric_only=True)
+            .rename(columns={c: f"count_{c}" for c in present_service_cols})
+        )
+        base = base.merge(svc_counts, on=["branch_id", "branch_name"], how="left")
+
+    # Closest competitors (top 10)
+    def _closest(group: pd.DataFrame) -> str:
+        g = group.sort_values("distance_miles").head(10)
+        return "; ".join(f"{n} ({d:.1f}mi)" for n, d in zip(g["company_name"], g["distance_miles"]))
+
+    closest = (
+        dfc.groupby(["branch_id", "branch_name"])
+        .apply(_closest)
+        .reset_index(name="closest_competitors")
+    )
+
+    base = base.merge(closest, on=["branch_id", "branch_name"], how="left")
+    return base
+
+
+# ---------------------------- Main Orchestration ---------------------------- #
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Map BrandSafway competitors around branch locations")
+    p.add_argument("--branches", required=True, help="CSV with branch_id, branch_name, latitude, longitude")
+    p.add_argument("--output_dir", default=".", help="Directory for output CSVs")
+
+    p.add_argument("--radius_miles", type=float, default=DEFAULT_RADIUS_MILES)
+    p.add_argument("--keywords", default="", help="Optional semicolon-separated keyword overrides")
+
+    # Cost/speed controls
+    p.add_argument("--max_candidates_per_branch", type=int, default=75, help="Cap candidates per branch to control cost (0 = no cap)")
+
+    # Prefilter (cost-control). Disable to maximize recall at higher cost.
+    p.add_argument("--disable_prefilter\", action=\"store_true\", help=\"Disable heuristic prefilter (higher cost, potentially higher recall)")
+    p.add_argument("--prefilter_min_score\", type=int, default=DEFAULT_PREFILTER_MIN_SCORE, help=\"Minimum prefilter score to run OpenAI enrichment when not cached")
+
+    # Concurrency controls
+    p.add_argument("--branch_workers", type=int, default=8, help="Parallelism for branch discovery")
+    p.add_argument("--enrich_workers", type=int, default=12, help="Parallelism for enrichment tasks")
+
+    # Throttling controls
+    p.add_argument("--places_rps", type=float, default=5.0, help="Max Places calls/sec across all threads")
+    p.add_argument("--openai_rps", type=float, default=1.5, help="Max OpenAI calls/sec across all threads")
+    p.add_argument("--openai_max_in_flight", type=int, default=6, help="Max concurrent OpenAI requests")
+
+    # OpenAI options
+    p.add_argument("--model", default=DEFAULT_MODEL)
+    p.add_argument("--openai_batch_size", type=int, default=3, help="Companies per OpenAI call (1 = no batching)")
+
+    # Cache
+    p.add_argument("--cache_path", default="enrichment_cache.json", help="Path to persistent cache JSON")
+    p.add_argument("--cache_ttl_days", type=int, default=90, help="Cache TTL in days (0 = no TTL)")
+
+    p.add_argument("--log_level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    return p.parse_args()
+
+
+def load_branches(path: Path) -> List[Branch]:
+    df = pd.read_csv(path)
+    required = {"branch_id", "branch_name", "latitude", "longitude"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"branches file missing columns: {sorted(missing)}")
+
+    branches: List[Branch] = []
+    for _, row in df.iterrows():
+        branches.append(
+            Branch(
+                branch_id=str(row["branch_id"]),
+                branch_name=str(row["branch_name"]),
+                latitude=float(row["latitude"]),
+                longitude=float(row["longitude"]),
+            )
+        )
+    return branches
+
+
+def main() -> None:
+    args = parse_args()
+
+    logging.basicConfig(
+        level=getattr(logging, args.log_level),
+        format="%(asctime)s | %(levelname)s | %(message)s",
+    )
+
+    # Validate required env vars early
+    places_key = ensure_env("GOOGLE_PLACES_API_KEY")
+    openai_key = ensure_env("OPENAI_API_KEY")
+    openai_base_url = ensure_env("OPENAI_BASE_URL")
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    keywords = DEFAULT_KEYWORDS
+    if args.keywords.strip():
+        keywords = [k.strip() for k in args.keywords.split(";") if k.strip()]
+
+    cache_ttl = None if args.cache_ttl_days == 0 else args.cache_ttl_days
+    cache = JsonCache(Path(args.cache_path), ttl_days=cache_ttl)
+
+    places = PlacesClient(
+        api_key=places_key,
+        calls_per_second=args.places_rps,
+        radius_miles=args.radius_miles,
+    )
+
+    enricher = OpenAIEnricher(
+        api_key=openai_key,
+        base_url=openai_base_url,
+        model=args.model,
+        calls_per_second=args.openai_rps,
+        max_in_flight=args.openai_max_in_flight,
+        cache=cache,
+        batch_size=args.openai_batch_size,
+    )
+
+    branches = load_branches(Path(args.branches))
+    logging.info("Loaded %s branches", len(branches))
+
+    # ------------------ Phase 1: Discover candidates (parallel per branch) ------------------ #
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    all_candidates: List[PlaceCandidate] = []
+
+    logging.info("Discovering candidates (branch_workers=%s)...", args.branch_workers)
+    with ThreadPoolExecutor(max_workers=max(1, args.branch_workers)) as ex:
+        futs = {
+            ex.submit(
+                discover_branch_candidates,
+                b,
+                places,
+                keywords,
+                args.radius_miles,
+                None if args.max_candidates_per_branch == 0 else args.max_candidates_per_branch,
+            ): b
+            for b in branches
+        }
+
+        for fut in as_completed(futs):
+            b = futs[fut]
+            try:
+                cands = fut.result()
+                all_candidates.extend(cands)
+                logging.info("Branch %s: %s candidates", b.branch_id, len(cands))
+            except Exception as e:
+                logging.error("Branch %s discovery failed: %s", b.branch_id, e)
+
+    if not all_candidates:
+        logging.warning("No candidates found. Exiting.")
+        return
+
+    logging.info("Total branch-place candidates: %s", len(all_candidates))
+
+    # ------------------ Phase 2: Global de-dupe places and enrich (parallel) ------------------ #
+
+    unique_places: Dict[str, Dict[str, Any]] = {}
+    for c in all_candidates:
+        if c.place_id not in unique_places:
+            unique_places[c.place_id] = {
+                "place_id": c.place_id,
+                "company_name": c.company_name,
+                "website": c.website,
+                "address": c.address,
+                "primary_type": c.primary_type,
+                "types": c.types,
+            }
+
+    place_list = list(unique_places.values())
+    logging.info("Unique places to enrich (before cache): %s", len(place_list))
+
+    # Prefilter gate (cost control): only run OpenAI enrichment on places with
+    # sufficient signal, unless already cached.
+    prefilter_meta: Dict[str, Dict[str, Any]] = {}
+    prefilter_skipped: set = set()
+    enrich_pool: List[Dict[str, Any]] = []
+
+    min_score = int(getattr(args, "prefilter_min_score", DEFAULT_PREFILTER_MIN_SCORE))
+    prefilter_enabled = not bool(getattr(args, "disable_prefilter", False))
+
+    for p in place_list:
+        pid = p["place_id"]
+        cached = enricher.get_cached(pid)
+        if cached is not None:
+            enrich_pool.append(p)
+            continue
+
+        if not prefilter_enabled:
+            enrich_pool.append(p)
+            continue
+
+        score, reasons = prefilter_score(p)
+        prefilter_meta[pid] = {
+            "prefilter_score": score,
+            "prefilter_reasons": ";".join(reasons),
+            "prefilter_skipped": score < min_score,
+        }
+        if score >= min_score:
+            enrich_pool.append(p)
+        else:
+            prefilter_skipped.add(pid)
+
+    # Determine which are cache misses among the enrichment pool
+    cache_misses = [p for p in enrich_pool if enricher.get_cached(p["place_id"]) is None]
+    logging.info("Cache misses requiring OpenAI calls (after prefilter): %s", len(cache_misses))
+    if prefilter_enabled:
+        logging.info("Prefilter skipped (not cached): %s", len(prefilter_skipped))
+
+    enriched_by_place_id: Dict[str, Dict[str, Any]] = {}
+
+    if cache_misses:
+        # Parallel enrichment. Each worker processes one batch (or one company).
+        batches = list(chunked(cache_misses, max(1, args.openai_batch_size))) if args.openai_batch_size > 1 else [[p] for p in cache_misses]
+
+        logging.info(
+            "Enriching with OpenAI (enrich_workers=%s, batch_size=%s, openai_rps=%s, max_in_flight=%s)...",
+            args.enrich_workers,
+            args.openai_batch_size,
+            args.openai_rps,
+            args.openai_max_in_flight,
+        )
+
+        with ThreadPoolExecutor(max_workers=max(1, args.enrich_workers)) as ex:
+            futs2 = []
+            for batch in batches:
+                futs2.append(ex.submit(enricher.enrich_missing, batch))
+
+            for fut in as_completed(futs2):
+                try:
+                    partial = fut.result()
+                    enriched_by_place_id.update(partial)
+                except Exception as e:
+                    logging.error("Enrichment batch failed: %s", e)
+
+        # Save cache after enrichment
+        cache.save()
+
+    # Pull cached values for everything (including hits and post-enrichment)
+    for p in place_list:
+        pid = p["place_id"]
+        cached = enricher.get_cached(pid)
+        if cached is not None:
+            enriched_by_place_id[pid] = cached
+            continue
+
+        # Not cached. If prefilter skipped it, attach a deterministic fallback.
+        if pid in prefilter_skipped:
+            meta = prefilter_meta.get(pid, {})
+            score = int(meta.get("prefilter_score", 0) or 0)
+            reasons = str(meta.get("prefilter_reasons", "no_signals")).split(";")
+            enriched_by_place_id[pid] = prefilter_fallback(score, reasons, min_score)
+            continue
+
+        # Hard fallback (e.g., enrichment failure)
+        enriched_by_place_id[pid] = {
+            "is_competitor": False,
+            "size_bucket": "Unknown",
+            "employee_estimate": "",
+            "service_offerings": {
+                "scaffolding": False,
+                "forming_shoring": False,
+                "industrial_insulation": False,
+                "coatings_painting": False,
+                "motorized_access": False,
+            },
+            "summary": "",
+            "top_sources": [],
+            "confidence": 0.0,
+        }
+
+    # ------------------ Phase 3: Join enrichment back to branch-level candidates ------------------ #
+
+    rows: List[Dict[str, Any]] = []
+    for c in all_candidates:
+        enrichment = enriched_by_place_id.get(c.place_id, {})
+        row = {
+            "branch_id": c.branch_id,
+            "branch_name": c.branch_name,
+            "branch_latitude": c.branch_latitude,
+            "branch_longitude": c.branch_longitude,
+            "place_id": c.place_id,
+            "company_name": c.company_name,
+            "address": c.address,
+            "latitude": c.latitude,
+            "longitude": c.longitude,
+            "website": c.website,
+            "primary_type": c.primary_type,
+            "types": c.types,
+            "rating": c.rating,
+            "user_rating_count": c.user_rating_count,
+            "distance_miles": c.distance_miles,
+        }
+        row.update(prefilter_meta.get(c.place_id, {}))
+        row.update(flatten_enrichment(enrichment))
+        rows.append(row)
+
+    df_out = pd.DataFrame(rows)
+
+    # Optional: keep only competitor rows in the main output? We'll keep all, but users can filter.
+    out_path = output_dir / "competitors_enriched.csv"
+    df_out.to_csv(out_path, index=False)
+    logging.info("Wrote: %s", out_path)
+
+    # Branch-level summary
+    df_summary = build_branch_summary(df_out)
+    summary_path = output_dir / "branch_competitor_summary.csv"
+    df_summary.to_csv(summary_path, index=False)
+    logging.info("Wrote: %s", summary_path)
+
+    # Final cache save (safe)
+    cache.save()
+
+
+if __name__ == "__main__":
+    main()
