@@ -8,10 +8,10 @@ Goal
 For each BrandSafway branch (lat/lon), identify nearby competitor locations within a
 specified radius (default: 30 miles) using Google Places API, then enrich each
 competitor with:
-  - Company size bucket (Micro/Small/Mid/Large/Enterprise/Unknown)
+  - Company size bucket (Small 0–49, Mid 50–249, Large 250+ employees; Unknown when evidence is thin)
   - Estimated employee range (if available)
   - Service offerings relevant to BrandSafway (scaffolding, forming/shoring,
-    industrial insulation, coatings/painting, motorized access)
+    insulation, painting, motorized, specialty)
 
 Enrichment is performed via the McKinsey QuantumBlack OpenAI Gateway using the
 Responses API with web_search enabled.
@@ -37,7 +37,6 @@ Usage
   python brand_competitor_counts_v5.py --branches branches.csv
 
 branches.csv must contain columns:
-  - branch_id
   - branch_name
   - latitude
   - longitude
@@ -91,14 +90,43 @@ PLACES_FIELDS = (
 )
 
 DEFAULT_KEYWORDS: List[str] = [
+    # Scaffolding / Access
     "industrial scaffolding contractor",
-    "scaffolding rental",
+    "containment scaffold contractor",
     "swing stage scaffolding",
-    "forming and shoring contractor",
+    "suspended access platform",
+    "mast climber contractor",
+    "industrial access solutions",
+
+    # Insulation
     "industrial insulation contractor",
+    "cryogenic insulation contractor",
+    "LNG insulation contractor",
+
+    # Coatings / Blasting
     "industrial coatings contractor",
-    "motorized access contractor",
+    "abrasive blasting contractor",
+    "protective coatings contractor",
+    "fireproofing contractor",
+
+    # Forming & Shoring (restricted)
+    "forming and shoring contractor",
+    "heavy civil shoring contractor",
+
+    # Specialty (industrial multi-trade / regulated)
+    "industrial fireproofing contractor",
+    "UL-listed firestopping contractor",
+    "industrial refractory contractor",
+    "industrial heat tracing contractor",
+    "cathodic protection contractor",
+    "leak sealing hot tapping contractor",
+
+    # Industrial multi-trade
+    "industrial turnaround contractor",
+    "industrial maintenance contractor",
 ]
+
+
 
 # Filter out obvious non-competitors (fast, cheap). This is intentionally
 # conservative; tune as needed.
@@ -122,6 +150,20 @@ BLOCK_TYPES = {
     "doctor",
     "school",
     "university",
+    "real_estate_agency",
+    "insurance_agency",
+    "lawyer",
+    "accounting",
+    "bank",
+    "travel_agency",
+    "tourist_attraction",
+    "gym",
+    "fitness_center",
+    "spa",
+    "church",
+    "mosque",
+    "synagogue",
+    "funeral_home",
 }
 
 EXCLUDE_NAME_SUBSTRINGS = {
@@ -134,10 +176,34 @@ DEFAULT_MODEL = "gpt-4o-mini"  # lower cost; override with --model if needed
 
 SYSTEM_PROMPT = (
     "You are an analyst mapping competitors to BrandSafway. "
-    "Use web search to determine the company's size and service offerings. "
-    "Be conservative: if you cannot verify a claim from credible sources, mark it Unknown/False and "
-    "lower confidence."
+    "BrandSafway operates in complex industrial environments including nuclear, LNG, "
+    "shipyards, heavy civil, semiconductor fabs, and pharmaceutical cleanrooms. "
+    "Core services include: industrial scaffolding and containment systems, "
+    "forming & shoring (heavy civil only), industrial insulation (including cryogenic), "
+    "industrial coatings/blasting/fireproofing, motorized access (MCWP, suspended platforms), "
+    "and specialty industrial services (e.g., refractory, heat tracing, cathodic protection, "
+    "UL-listed firestopping, leak sealing/hot tapping, lead/asbestos abatement). "
+    "Do NOT classify companies focused on residential construction, decorative painting, "
+    "residential fireproofing, or generic commercial concrete as competitors. "
+    "Be conservative. If industrial scope cannot be verified from credible sources, "
+    "mark is_competitor=False and reduce confidence."
 )
+
+
+# Service offering keys; each has a boolean and a _confidence (0-1) in the schema.
+SERVICE_KEYS = [
+    "scaffolding",
+    "forming_shoring",
+    "insulation",
+    "painting",
+    "motorized",
+    "specialty",
+]
+
+# Size buckets: Small 0-49, Mid 50-249, Large 250+ employees; Unknown when evidence is thin.
+SIZE_BUCKETS = ["Small", "Mid", "Large", "Unknown"]
+MIN_SERVICE_CONFIDENCE = 0.7  # Service "match" only when confidence >= this.
+
 
 # ---------------------------- Utilities ---------------------------- #
 
@@ -201,7 +267,6 @@ def safe_json_dump(path: Path, data: Any) -> None:
 
 @dataclass(frozen=True)
 class Branch:
-    branch_id: str
     branch_name: str
     latitude: float
     longitude: float
@@ -209,7 +274,6 @@ class Branch:
 
 @dataclass
 class PlaceCandidate:
-    branch_id: str
     branch_name: str
     branch_latitude: float
     branch_longitude: float
@@ -314,6 +378,8 @@ class PlacesClient:
             self._limiter.wait()
             try:
                 resp = self._session().post(url, headers=self._headers(), json=body, timeout=self._timeout_s)
+                if resp.status_code == 400:
+                    raise requests.HTTPError(f"HTTP 400 Bad Request: {resp.text[:500]}")
                 if resp.status_code in (429, 500, 502, 503, 504):
                     raise requests.HTTPError(f"HTTP {resp.status_code}: {resp.text[:200]}")
                 resp.raise_for_status()
@@ -327,9 +393,10 @@ class PlacesClient:
         raise RuntimeError("Unreachable")
 
     def search_text(self, lat: float, lon: float, query: str) -> List[Dict[str, Any]]:
+        # searchText only supports locationBias with circle (not locationRestriction.circle).
         body = {
             "textQuery": query,
-            "locationRestriction": {
+            "locationBias": {
                 "circle": {
                     "center": {"latitude": lat, "longitude": lon},
                     "radius": self._radius_meters,
@@ -401,49 +468,103 @@ class OpenAIEnricher:
         return self._local.client
 
     @staticmethod
+    def _service_offerings_schema() -> Tuple[Dict[str, Any], List[str]]:
+        """Build service_offerings object schema: each service has bool, _confidence (0-1), _evidence (string)."""
+        props: Dict[str, Any] = {}
+        req: List[str] = []
+        for k in SERVICE_KEYS:
+            props[k] = {"type": "boolean"}
+            props[k + "_confidence"] = {"type": "number", "minimum": 0.0, "maximum": 1.0}
+            props[k + "_evidence"] = {"type": "string"}
+            req.extend([k, k + "_confidence", k + "_evidence"])
+        return (
+            {
+                "type": "object",
+                "properties": props,
+                "required": req,
+                "additionalProperties": False,
+            },
+            req,
+        )
+
+    @staticmethod
     def _single_schema() -> Dict[str, Any]:
+        svc_schema, _ = OpenAIEnricher._service_offerings_schema()
         return {
             "type": "object",
             "properties": {
                 "is_competitor": {"type": "boolean"},
                 "size_bucket": {
                     "type": "string",
-                    "enum": ["Micro", "Small", "Mid", "Large", "Enterprise", "Unknown"],
+                    "enum": SIZE_BUCKETS,
                 },
                 "employee_estimate": {"type": "string"},
-                "service_offerings": {
-                    "type": "object",
-                    "properties": {
-                        "scaffolding": {"type": "boolean"},
-                        "forming_shoring": {"type": "boolean"},
-                        "industrial_insulation": {"type": "boolean"},
-                        "coatings_painting": {"type": "boolean"},
-                        "motorized_access": {"type": "boolean"},
-                    },
-                    "required": [
-                        "scaffolding",
-                        "forming_shoring",
-                        "industrial_insulation",
-                        "coatings_painting",
-                        "motorized_access",
-                    ],
-                },
+                "size_confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                "size_evidence": {"type": "string"},
+                "service_offerings": svc_schema,
                 "summary": {"type": "string"},
                 "top_sources": {"type": "array", "items": {"type": "string"}},
+                "citations": {"type": "string"},
                 "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
             },
-            "required": ["is_competitor", "size_bucket", "service_offerings", "confidence"],
+            "required": [
+                "is_competitor",
+                "size_bucket",
+                "employee_estimate",
+                "size_confidence",
+                "size_evidence",
+                "service_offerings",
+                "summary",
+                "top_sources",
+                "citations",
+                "confidence",
+            ],
+            "additionalProperties": False,
         }
 
     @staticmethod
     def _batch_schema() -> Dict[str, Any]:
-        item = OpenAIEnricher._single_schema()
-        item = {"type": "object", "properties": {"place_id": {"type": "string"}, **item["properties"]},
-                "required": ["place_id", *item["required"]]}
+        svc_schema, _ = OpenAIEnricher._service_offerings_schema()
+        batch_item = {
+            "type": "object",
+            "properties": {
+                "place_id": {"type": "string"},
+                "is_competitor": {"type": "boolean"},
+                "size_bucket": {
+                    "type": "string",
+                    "enum": SIZE_BUCKETS,
+                },
+                "employee_estimate": {"type": "string"},
+                "size_confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                "size_evidence": {"type": "string"},
+                "service_offerings": svc_schema,
+                "summary": {"type": "string"},
+                "top_sources": {"type": "array", "items": {"type": "string"}},
+                "citations": {"type": "string"},
+                "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+            },
+            "required": [
+                "place_id",
+                "is_competitor",
+                "size_bucket",
+                "employee_estimate",
+                "size_confidence",
+                "size_evidence",
+                "service_offerings",
+                "summary",
+                "top_sources",
+                "citations",
+                "confidence",
+            ],
+            "additionalProperties": False,
+        }
         return {
             "type": "object",
-            "properties": {"results": {"type": "array", "items": item}},
+            "properties": {
+                "results": {"type": "array", "items": batch_item},
+            },
             "required": ["results"],
+            "additionalProperties": False,
         }
 
     def get_cached(self, place_id: str) -> Optional[Dict[str, Any]]:
@@ -495,15 +616,12 @@ class OpenAIEnricher:
             "is_competitor": False,
             "size_bucket": "Unknown",
             "employee_estimate": "",
-            "service_offerings": {
-                "scaffolding": False,
-                "forming_shoring": False,
-                "industrial_insulation": False,
-                "coatings_painting": False,
-                "motorized_access": False,
-            },
+            "size_confidence": 0.0,
+            "size_evidence": "",
+            "service_offerings": _default_service_offerings(),
             "summary": "",
             "top_sources": [],
+            "citations": "",
             "confidence": 0.0,
         }
         self._cache.set(place["place_id"], fallback)
@@ -535,15 +653,12 @@ class OpenAIEnricher:
                 "is_competitor": False,
                 "size_bucket": "Unknown",
                 "employee_estimate": "",
-                "service_offerings": {
-                    "scaffolding": False,
-                    "forming_shoring": False,
-                    "industrial_insulation": False,
-                    "coatings_painting": False,
-                    "motorized_access": False,
-                },
+                "size_confidence": 0.0,
+                "size_evidence": "",
+                "service_offerings": _default_service_offerings(),
                 "summary": "",
                 "top_sources": [],
+                "citations": "",
                 "confidence": 0.0,
             }
             self._cache.set(p["place_id"], out[p["place_id"]])
@@ -560,18 +675,17 @@ class OpenAIEnricher:
             f"Website: {website or 'N/A'}\n"
             f"Address: {address or 'N/A'}\n\n"
             "Task:\n"
-            "1) Determine if this company competes with BrandSafway in access/scaffolding or related services.\n"
-            "2) Determine company size bucket and (if possible) an employee range estimate.\n"
-            "3) Mark which services they offer:\n"
-            "   - Scaffolding\n"
-            "   - Forming/Shoring\n"
-            "   - Industrial Insulation\n"
-            "   - Coatings/Painting\n"
-            "   - Motorized Access\n\n"
-            "Guidelines:\n"
-            "- Use web search. Prefer the company's site, reputable directories, or industry sources.\n"
-            "- If you cannot verify, mark Unknown/False and lower confidence.\n"
-            "- Provide a 1-2 sentence summary and up to 3 source URLs.\n"
+            "1) Determine whether this company competes with BrandSafway in industrial access or related services.\n"
+            "2) For each service type, set the boolean, _confidence (0.0–1.0), and _evidence (short text with helpful keywords):\n"
+            "   - scaffolding: industrial/containment/engineered access; scaffolding_evidence e.g. 'tube-and-clamp, shoring, containment'\n"
+            "   - forming_shoring: heavy civil/structural only; forming_shoring_evidence e.g. 'bridge, dam, nuclear formwork'\n"
+            "   - insulation: industrial/cryogenic/LNG; insulation_evidence e.g. 'pipe insulation, cryogenic, refractory'\n"
+            "   - painting: industrial coatings/blasting/fireproofing; painting_evidence e.g. 'protective coatings, sandblasting, fireproofing'\n"
+            "   - motorized: MCWP, mast climbers, suspended platforms; motorized_evidence e.g. 'mast climber, swing stage, BMU'\n"
+            "   - specialty: refractory, heat tracing, cathodic protection, UL firestopping, leak sealing, abatement; specialty_evidence with keywords\n"
+            "3) Size bucket: Small (0–49), Mid (50–249), Large (250+), or Unknown. size_confidence (0–1), size_evidence (brief). employee_estimate: free-text range when known.\n"
+            "4) citations: List ALL web-searched URLs or source references used (semicolon-separated) for full traceability.\n\n"
+            "Guardrails: No decorative/residential-only; Forming & Shoring only for heavy civil/nuclear; Specialty only for industrial/regulated. Confidence >= 0.7 = solid match."
         )
 
         with self._sema:
@@ -610,11 +724,12 @@ class OpenAIEnricher:
         ]
 
         prompt = (
-            "You will be given a JSON list of companies. For EACH company, use web search to determine: "
-            "(a) whether it competes with BrandSafway, (b) size bucket and employee estimate if possible, "
-            "(c) whether it offers: scaffolding, forming/shoring, industrial insulation, coatings/painting, motorized access. "
-            "Return results as an array with one item per input company, preserving place_id. "
-            "Limit sources to up to 3 URLs per company.\n\n"
+            "You will be given a JSON list of companies. For EACH company, use web search to determine:\n"
+            "(a) is_competitor: whether it competes with BrandSafway.\n"
+            "(b) Size bucket: Small (0–49), Mid (50–249), Large (250+), or Unknown. size_confidence (0–1), size_evidence (brief). employee_estimate: free-text range when known.\n"
+            "(c) For each service (scaffolding, forming_shoring, insulation, painting, motorized, specialty): set the boolean, _confidence (0–1), and _evidence (short text with helpful keywords, e.g. 'containment, tube-and-clamp' for scaffolding). Only confidence >= 0.7 counts as a solid match.\n"
+            "(d) citations: List ALL web-searched URLs/sources used for this company (semicolon-separated) for traceability.\n"
+            "Return one object per input company with the same place_id. Populate top_sources with up to 3 URLs and citations with all sources used.\n\n"
             f"INPUT_COMPANIES_JSON:\n{json.dumps(companies_payload, ensure_ascii=False)}"
         )
 
@@ -656,15 +771,12 @@ class OpenAIEnricher:
                     "is_competitor": False,
                     "size_bucket": "Unknown",
                     "employee_estimate": "",
-                    "service_offerings": {
-                        "scaffolding": False,
-                        "forming_shoring": False,
-                        "industrial_insulation": False,
-                        "coatings_painting": False,
-                        "motorized_access": False,
-                    },
+                    "size_confidence": 0.0,
+                    "size_evidence": "",
+                    "service_offerings": _default_service_offerings(),
                     "summary": "",
                     "top_sources": [],
+                    "citations": "",
                     "confidence": 0.0,
                 }
         return out
@@ -701,6 +813,7 @@ DEFAULT_PREFILTER_MIN_SCORE = 2
 
 # Strong service hints that frequently indicate BrandSafway-like competitors.
 PREFILTER_STRONG_TERMS = {
+    # Access / Scaffold / Motorized
     "scaffold",
     "scaffolding",
     "swing stage",
@@ -715,8 +828,12 @@ PREFILTER_STRONG_TERMS = {
     "work platform",
     "work platforms",
     "motorized access",
+
+    # Insulation
     "industrial insulation",
     "insulation",
+
+    # Coatings / Fireproofing
     "fireproofing",
     "coatings",
     "coating",
@@ -724,7 +841,61 @@ PREFILTER_STRONG_TERMS = {
     "protective coatings",
     "abrasive blasting",
     "sandblasting",
+    "linings",
+    "lining",
+    "chemical resistant",
+
+    # Specialty (industrial multi-trade)
+    "refractory",
+    "heat tracing",
+    "cathodic protection",
+    "cp",  # keep for recall; model should confirm context via enrichment
+    "firestopping",
+    "fire stopping",
+    "ul-listed firestopping",
+    "intumescent",
+    "leak sealing",
+    "leak detection",
+    "hot tapping",
+    "frp",
+    "abatement",
+    "asbestos abatement",
+    "lead abatement",
+
+    # Nuclear
+    "nuclear",
+    "containment",
+    "reactor",
+    "turbine building",
+    "nqa-1",
+    "alara",
+
+    # LNG
+    "lng",
+    "cryogenic",
+    "cold box",
+    "mche",
+    "compressor building",
+
+    # Shipyard
+    "dry dock",
+    "shipyard",
+
+    # Industrial coating certifications
+    "ampp",
+    "qp",
+    "qs",
+
+    # Pharma / cleanroom
+    "cleanroom",
+    "gmp",
+
+    # Federal
+    "em 385",
+    "doe",
+    "dod",
 }
+
 
 # Context terms that can support the strong terms (weak signal by themselves).
 PREFILTER_CONTEXT_TERMS = {
@@ -765,6 +936,10 @@ PREFILTER_NEGATIVE_TERMS = {
     "kitchen",
     "bath",
     "residential",
+    "home remodeling",
+    "interior painting",
+    "house painting",
+    "driveway",
 }
 
 # Place types that can indicate relevance. These are intentionally broad; the score
@@ -847,21 +1022,17 @@ def prefilter_score(place_payload: Dict[str, Any]) -> Tuple[int, List[str]]:
 
 def prefilter_fallback(score: int, reasons: List[str], min_score: int) -> Dict[str, Any]:
     """Fallback enrichment record for prefiltered-out items."""
-
     reason_str = ";".join(reasons[:3])
     return {
         "is_competitor": False,
         "size_bucket": "Unknown",
         "employee_estimate": "",
-        "service_offerings": {
-            "scaffolding": False,
-            "forming_shoring": False,
-            "industrial_insulation": False,
-            "coatings_painting": False,
-            "motorized_access": False,
-        },
+        "size_confidence": 0.0,
+        "size_evidence": "",
+        "service_offerings": _default_service_offerings(),
         "summary": f"Prefilter skipped enrichment (score={score} < {min_score}). Reasons: {reason_str}.",
         "top_sources": [],
+        "citations": "",
         "confidence": 0.0,
     }
 
@@ -885,7 +1056,6 @@ def place_to_candidate(branch: Branch, place: Dict[str, Any], radius_miles: floa
     address = (place.get("formattedAddress") or "").strip()
 
     return PlaceCandidate(
-        branch_id=branch.branch_id,
         branch_name=branch.branch_name,
         branch_latitude=branch.latitude,
         branch_longitude=branch.longitude,
@@ -922,18 +1092,19 @@ def discover_branch_candidates(
                 if pid and pid not in discovered:
                     discovered[pid] = p
         except Exception as e:
-            logging.warning("Branch %s keyword '%s' search failed: %s", branch.branch_id, kw, e)
+            logging.warning("Branch %s keyword '%s' search failed: %s", branch.branch_name, kw, e)
 
-    # 2) Nearby type search (broad net; can be noisy but helpful)
-    # Types list can be tuned. Keep modest to avoid too much noise.
+    # 2) Nearby type search (broad net; can be noisy but helpful).
+    # Must use Table A types only (see Places API place-types). equipment_rental_agency /
+    # general_contractor are not in Table A for searchNearby.
     try:
-        nearby_types = ["equipment_rental_agency", "general_contractor"]
+        nearby_types = ["hardware_store", "home_improvement_store"]
         for p in places.search_nearby(branch.latitude, branch.longitude, nearby_types):
             pid = p.get("id")
             if pid and pid not in discovered:
                 discovered[pid] = p
     except Exception as e:
-        logging.warning("Branch %s nearby search failed: %s", branch.branch_id, e)
+        logging.warning("Branch %s nearby search failed: %s", branch.branch_name, e)
 
     candidates: List[PlaceCandidate] = []
     for p in discovered.values():
@@ -955,23 +1126,55 @@ def discover_branch_candidates(
 # ---------------------------- Outputs & Summaries ---------------------------- #
 
 
-def flatten_enrichment(enrichment: Dict[str, Any]) -> Dict[str, Any]:
-    """Flatten nested enrichment into a single-level dict for CSV."""
+def _default_service_offerings() -> Dict[str, Any]:
+    """Default service_offerings: each service has bool False, confidence 0, evidence ''."""
+    out: Dict[str, Any] = {}
+    for k in SERVICE_KEYS:
+        out[k] = False
+        out[k + "_confidence"] = 0.0
+        out[k + "_evidence"] = ""
+    return out
 
-    svc = enrichment.get("service_offerings") or {}
-    flat = {
+
+def _citations_string(enrichment: Dict[str, Any]) -> str:
+    """Build citations string: only non-empty URLs, joined by '; '. No empty semicolons."""
+    urls: List[str] = []
+    raw = enrichment.get("citations")
+    if isinstance(raw, str) and raw.strip():
+        urls = [u.strip() for u in raw.split(";") if u.strip()]
+    if not urls:
+        for u in enrichment.get("top_sources") or []:
+            if isinstance(u, str) and u.strip():
+                urls.append(u.strip())
+    return "; ".join(urls) if urls else ""
+
+
+def flatten_enrichment(enrichment: Dict[str, Any]) -> Dict[str, Any]:
+    """Flatten nested enrichment into a single-level dict for CSV.
+    Outputs ChatGPT schema: for each service, {service}, {service}_confidence, {service}_evidence.
+    citations is last and contains only 'url; url; url' when found (no empty semicolons).
+    """
+    svc = dict(enrichment.get("service_offerings") or {})
+    for k in SERVICE_KEYS:
+        if k + "_confidence" not in svc:
+            svc[k + "_confidence"] = 0.0
+        if k + "_evidence" not in svc:
+            svc[k + "_evidence"] = ""
+
+    flat: Dict[str, Any] = {
         "is_competitor": enrichment.get("is_competitor"),
         "size_bucket": enrichment.get("size_bucket"),
         "employee_estimate": enrichment.get("employee_estimate", ""),
-        "offers_scaffolding": bool(svc.get("scaffolding")),
-        "offers_forming_shoring": bool(svc.get("forming_shoring")),
-        "offers_industrial_insulation": bool(svc.get("industrial_insulation")),
-        "offers_coatings_painting": bool(svc.get("coatings_painting")),
-        "offers_motorized_access": bool(svc.get("motorized_access")),
+        "size_confidence": enrichment.get("size_confidence") if enrichment.get("size_confidence") is not None else 0.0,
+        "size_evidence": enrichment.get("size_evidence", ""),
         "summary": enrichment.get("summary", ""),
-        "top_sources": ";".join(enrichment.get("top_sources") or []),
         "confidence": enrichment.get("confidence"),
     }
+    for k in SERVICE_KEYS:
+        flat[k] = bool(svc.get(k))
+        flat[k + "_confidence"] = float(svc.get(k + "_confidence", 0.0))
+        flat[k + "_evidence"] = svc.get(k + "_evidence", "") or ""
+    flat["citations"] = _citations_string(enrichment)
     return flat
 
 
@@ -985,10 +1188,10 @@ def build_branch_summary(df: pd.DataFrame) -> pd.DataFrame:
         dfc = df.copy()
 
     if dfc.empty:
-        return pd.DataFrame(columns=["branch_id", "branch_name", "competitor_count"])  # empty but valid
+        return pd.DataFrame(columns=["branch_name", "competitor_count"])  # empty but valid
 
     base = (
-        dfc.groupby(["branch_id", "branch_name"], as_index=False)
+        dfc.groupby("branch_name", as_index=False)
         .agg(
             competitor_count=("place_id", "nunique"),
             avg_distance_miles=("distance_miles", "mean"),
@@ -1000,7 +1203,7 @@ def build_branch_summary(df: pd.DataFrame) -> pd.DataFrame:
     if "size_bucket" in dfc.columns:
         size_counts = (
             dfc.pivot_table(
-                index=["branch_id", "branch_name"],
+                index="branch_name",
                 columns="size_bucket",
                 values="place_id",
                 aggfunc="nunique",
@@ -1010,27 +1213,20 @@ def build_branch_summary(df: pd.DataFrame) -> pd.DataFrame:
         )
         # Normalize column names
         size_counts.columns = [
-            ("size_" + str(c).lower().replace(" ", "_") if c not in ("branch_id", "branch_name") else c)
+            ("size_" + str(c).lower().replace(" ", "_") if c != "branch_name" else c)
             for c in size_counts.columns
         ]
-        base = base.merge(size_counts, on=["branch_id", "branch_name"], how="left")
+        base = base.merge(size_counts, on="branch_name", how="left")
 
-    # Service counts
-    service_cols = [
-        "offers_scaffolding",
-        "offers_forming_shoring",
-        "offers_industrial_insulation",
-        "offers_coatings_painting",
-        "offers_motorized_access",
-    ]
-    present_service_cols = [c for c in service_cols if c in dfc.columns]
-    if present_service_cols:
-        svc_counts = (
-            dfc.groupby(["branch_id", "branch_name"], as_index=False)[present_service_cols]
-            .sum(numeric_only=True)
-            .rename(columns={c: f"count_{c}" for c in present_service_cols})
-        )
-        base = base.merge(svc_counts, on=["branch_id", "branch_name"], how="left")
+    # Service counts: high-confidence (>=0.7) matches only (schema columns: scaffolding, scaffolding_confidence, etc.)
+    svc_df = dfc[["branch_name"]].copy()
+    for k in SERVICE_KEYS:
+        if k in dfc.columns and (k + "_confidence") in dfc.columns:
+            high = (dfc[k] == True) & (dfc[k + "_confidence"] >= MIN_SERVICE_CONFIDENCE)  # noqa: E712
+            svc_df[f"count_{k}_high_confidence"] = high.astype(int)
+    if len(svc_df.columns) > 1:
+        svc_counts = svc_df.groupby("branch_name", as_index=False).sum()
+        base = base.merge(svc_counts, on="branch_name", how="left")
 
     # Closest competitors (top 10)
     def _closest(group: pd.DataFrame) -> str:
@@ -1038,12 +1234,12 @@ def build_branch_summary(df: pd.DataFrame) -> pd.DataFrame:
         return "; ".join(f"{n} ({d:.1f}mi)" for n, d in zip(g["company_name"], g["distance_miles"]))
 
     closest = (
-        dfc.groupby(["branch_id", "branch_name"])
+        dfc.groupby("branch_name")
         .apply(_closest)
         .reset_index(name="closest_competitors")
     )
 
-    base = base.merge(closest, on=["branch_id", "branch_name"], how="left")
+    base = base.merge(closest, on="branch_name", how="left")
     return base
 
 
@@ -1052,8 +1248,8 @@ def build_branch_summary(df: pd.DataFrame) -> pd.DataFrame:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Map BrandSafway competitors around branch locations")
-    p.add_argument("--branches", required=True, help="CSV with branch_id, branch_name, latitude, longitude")
-    p.add_argument("--output_dir", default=".", help="Directory for output CSVs")
+    p.add_argument("--branches", required=True, help="CSV with branch_name, latitude, longitude")
+    p.add_argument("--output_dir", default="out", help="Directory for output CSVs")
 
     p.add_argument("--radius_miles", type=float, default=DEFAULT_RADIUS_MILES)
     p.add_argument("--keywords", default="", help="Optional semicolon-separated keyword overrides")
@@ -1062,8 +1258,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max_candidates_per_branch", type=int, default=75, help="Cap candidates per branch to control cost (0 = no cap)")
 
     # Prefilter (cost-control). Disable to maximize recall at higher cost.
-    p.add_argument("--disable_prefilter\", action=\"store_true\", help=\"Disable heuristic prefilter (higher cost, potentially higher recall)")
-    p.add_argument("--prefilter_min_score\", type=int, default=DEFAULT_PREFILTER_MIN_SCORE, help=\"Minimum prefilter score to run OpenAI enrichment when not cached")
+    p.add_argument("--disable_prefilter", action="store_true", help="Disable heuristic prefilter (higher cost, potentially higher recall)")
+    p.add_argument("--prefilter_min_score", type=int, default=DEFAULT_PREFILTER_MIN_SCORE, help="Minimum prefilter score to run OpenAI enrichment when not cached")
 
     # Concurrency controls
     p.add_argument("--branch_workers", type=int, default=8, help="Parallelism for branch discovery")
@@ -1088,7 +1284,7 @@ def parse_args() -> argparse.Namespace:
 
 def load_branches(path: Path) -> List[Branch]:
     df = pd.read_csv(path)
-    required = {"branch_id", "branch_name", "latitude", "longitude"}
+    required = {"branch_name", "latitude", "longitude"}
     missing = required - set(df.columns)
     if missing:
         raise ValueError(f"branches file missing columns: {sorted(missing)}")
@@ -1097,7 +1293,6 @@ def load_branches(path: Path) -> List[Branch]:
     for _, row in df.iterrows():
         branches.append(
             Branch(
-                branch_id=str(row["branch_id"]),
                 branch_name=str(row["branch_name"]),
                 latitude=float(row["latitude"]),
                 longitude=float(row["longitude"]),
@@ -1172,9 +1367,9 @@ def main() -> None:
             try:
                 cands = fut.result()
                 all_candidates.extend(cands)
-                logging.info("Branch %s: %s candidates", b.branch_id, len(cands))
+                logging.info("Branch %s: %s candidates", b.branch_name, len(cands))
             except Exception as e:
-                logging.error("Branch %s discovery failed: %s", b.branch_id, e)
+                logging.error("Branch %s discovery failed: %s", b.branch_name, e)
 
     if not all_candidates:
         logging.warning("No candidates found. Exiting.")
@@ -1286,15 +1481,12 @@ def main() -> None:
             "is_competitor": False,
             "size_bucket": "Unknown",
             "employee_estimate": "",
-            "service_offerings": {
-                "scaffolding": False,
-                "forming_shoring": False,
-                "industrial_insulation": False,
-                "coatings_painting": False,
-                "motorized_access": False,
-            },
+            "size_confidence": 0.0,
+            "size_evidence": "",
+            "service_offerings": _default_service_offerings(),
             "summary": "",
             "top_sources": [],
+            "citations": "",
             "confidence": 0.0,
         }
 
@@ -1304,7 +1496,6 @@ def main() -> None:
     for c in all_candidates:
         enrichment = enriched_by_place_id.get(c.place_id, {})
         row = {
-            "branch_id": c.branch_id,
             "branch_name": c.branch_name,
             "branch_latitude": c.branch_latitude,
             "branch_longitude": c.branch_longitude,

@@ -1,0 +1,523 @@
+{
+  "ChIJq6pW24F4hlQRkBM6NeT7bz8": {
+    "ts": 1770838729.2986274,
+    "value": {
+      "is_competitor": true,
+      "size_bucket": "Mid",
+      "employee_estimate": "50–249",
+      "size_confidence": 0.8,
+      "size_evidence": "Company offers a range of scaffolding services, indicating a mid-sized operation.",
+      "service_offerings": {
+        "scaffolding": true,
+        "scaffolding_confidence": 0.9,
+        "scaffolding_evidence": "Provides various scaffolding systems, including British scaffolding, tube and fitting systems, and all-round scaffold systems.",
+        "forming_shoring": false,
+        "forming_shoring_confidence": 0.2,
+        "forming_shoring_evidence": "No evidence found of forming and shoring services.",
+        "insulation": false,
+        "insulation_confidence": 0.2,
+        "insulation_evidence": "No evidence found of insulation services.",
+        "painting": false,
+        "painting_confidence": 0.2,
+        "painting_evidence": "No evidence found of painting services.",
+        "motorized": false,
+        "motorized_confidence": 0.2,
+        "motorized_evidence": "No evidence found of motorized access services.",
+        "specialty": false,
+        "specialty_confidence": 0.2,
+        "specialty_evidence": "No evidence found of specialty industrial services."
+      },
+      "summary": "Tricities Scaffolding is a mid-sized company based in Coquitlam, BC, specializing in scaffolding services for both residential and commercial projects.",
+      "top_sources": [
+        "https://tricitiesscaffolding.ca/",
+        "https://tricitiesscaffolding.ca/services/",
+        "https://tricitiesscaffolding.ca/contact-us/"
+      ],
+      "citations": "https://tricitiesscaffolding.ca/;https://tricitiesscaffolding.ca/services/;https://tricitiesscaffolding.ca/contact-us/",
+      "confidence": 0.8
+    }
+  },
+  "ChIJxXPcJgnWhVQRFrE_9U5evww": {
+    "ts": 1770838729.6695197,
+    "value": {
+      "is_competitor": false,
+      "size_bucket": "Small",
+      "employee_estimate": "1-10 employees",
+      "size_confidence": 0.9,
+      "size_evidence": "SignalHire estimates 1-10 employees.",
+      "service_offerings": {
+        "scaffolding": false,
+        "scaffolding_confidence": 0.0,
+        "scaffolding_evidence": "No scaffolding services listed.",
+        "forming_shoring": false,
+        "forming_shoring_confidence": 0.0,
+        "forming_shoring_evidence": "No forming or shoring services listed.",
+        "insulation": false,
+        "insulation_confidence": 0.0,
+        "insulation_evidence": "No insulation services listed.",
+        "painting": true,
+        "painting_confidence": 0.9,
+        "painting_evidence": "Offers priming and painting services.",
+        "motorized": false,
+        "motorized_confidence": 0.0,
+        "motorized_evidence": "No motorized access services listed.",
+        "specialty": true,
+        "specialty_confidence": 0.8,
+        "specialty_evidence": "Provides powder coating and burn-off services."
+      },
+      "summary": "Tri-City Sandblasting Ltd. specializes in industrial sandblasting, priming, painting, and powder coating services, primarily serving industries such as mining, oil, gas, and manufacturing.",
+      "top_sources": [
+        "([tricitysandblasting.ca](https://www.tricitysandblasting.ca/?utm_source=openai))",
+        "([tricitysandblasting.ca](https://tricitysandblasting.ca/industrial.html?utm_source=openai))",
+        "([tricitysandblasting.ca](https://tricitysandblasting.ca/about.html?utm_source=openai))"
+      ],
+      "citations": "([tricitysandblasting.ca](https://www.tricitysandblasting.ca/?utm_source=openai));([tricitysandblasting.ca](https://tricitysandblasting.ca/industrial.html?utm_source=openai));([tricitysandblasting.ca](https://tricitysandblasting.ca/about.html?utm_source=openai));([mapquest.com](https://www.mapquest.com/ca/british-columbia/tri-city-sandblasting-ltd-499415653?utm_source=openai));([signalhire.com](https://www.signalhire.com/companies/tri-city-sandblasting-ltd?utm_source=openai))",
+      "confidence": 0.9
+    }
+  },
+  "ChIJ5zsfWc54hlQRQMxihZEIS78": {
+    "ts": 1770838730.5097826,
+    "value": {
+      "is_competitor": false,
+      "size_bucket": "Small",
+      "employee_estimate": "1–10 employees",
+      "size_confidence": 0.9,
+      "size_evidence": "Limited online presence and small-scale operations suggest a small team.",
+      "service_offerings": {
+        "scaffolding": false,
+        "scaffolding_confidence": 0,
+        "scaffolding_evidence": "No evidence of scaffolding services offered.",
+        "forming_shoring": false,
+        "forming_shoring_confidence": 0,
+        "forming_shoring_evidence": "No evidence of forming and shoring services offered.",
+        "insulation": false,
+        "insulation_confidence": 0,
+        "insulation_evidence": "No evidence of insulation services offered.",
+        "painting": false,
+        "painting_confidence": 0,
+        "painting_evidence": "No evidence of painting services offered.",
+        "motorized": false,
+        "motorized_confidence": 0,
+        "motorized_evidence": "No evidence of motorized access services offered.",
+        "specialty": false,
+        "specialty_confidence": 0,
+        "specialty_evidence": "No evidence of specialty industrial services offered."
+      },
+      "summary": "Canadian Floor Coatings specializes in epoxy floor coatings and concrete polishing for residential, commercial, and industrial clients in the Vancouver area.",
+      "top_sources": [
+        "https://canadianfloorcoatings.com/",
+        "https://canadianfloorcoatings.com/contact-us/",
+        "https://canadianfloorcoatings.com/get-quote/"
+      ],
+      "citations": "https://canadianfloorcoatings.com/;https://canadianfloorcoatings.com/contact-us/;https://canadianfloorcoatings.com/get-quote/",
+      "confidence": 0.9
+    }
+  },
+  "ChIJde3-TjjYhVQR_5et3cvU-LY": {
+    "ts": 1770838733.4044492,
+    "value": {
+      "is_competitor": true,
+      "size_bucket": "Large",
+      "employee_estimate": "51-200 employees",
+      "size_confidence": 0.9,
+      "size_evidence": "LinkedIn profile indicates 71 employees; company operates multiple offices across British Columbia, Alberta, and the United States.",
+      "service_offerings": {
+        "scaffolding": true,
+        "scaffolding_confidence": 0.9,
+        "scaffolding_evidence": "Aarc-West Industrial Coatings Inc. provides scaffolding services through its affiliate, Aarc-West Scaffolding.",
+        "forming_shoring": false,
+        "forming_shoring_confidence": 0.2,
+        "forming_shoring_evidence": "No evidence found of forming and shoring services offered by Aarc-West Industrial Coatings Inc.",
+        "insulation": true,
+        "insulation_confidence": 0.9,
+        "insulation_evidence": "Aarc-West Industrial Coatings Inc. offers in-house insulation applications, including industrial and marine insulation.",
+        "painting": true,
+        "painting_confidence": 0.9,
+        "painting_evidence": "Aarc-West Industrial Coatings Inc. provides sandblasting and painting services for structural steel, vessels, tanks, pipes, and equipment.",
+        "motorized": false,
+        "motorized_confidence": 0.2,
+        "motorized_evidence": "No evidence found of motorized access services offered by Aarc-West Industrial Coatings Inc.",
+        "specialty": true,
+        "specialty_confidence": 0.8,
+        "specialty_evidence": "Aarc-West Industrial Coatings Inc. offers fireproofing, lead abatement, and in-house quality control and assurance services."
+      },
+      "summary": "Aarc-West Industrial Coatings Inc. is a large, diversified company specializing in industrial coatings, sandblasting, painting, fireproofing, and in-house insulation applications. They operate multiple offices across British Columbia, Alberta, and the United States, offering a wide range of services to various industries.",
+      "top_sources": [
+        "https://awcoatings.com/",
+        "https://awcoatings.com/company/about-us/",
+        "https://awcoatings.com/services/"
+      ],
+      "citations": "https://awcoatings.com/;https://awcoatings.com/company/about-us/;https://awcoatings.com/services/;https://ca.linkedin.com/company/aarc-west-mechanical-insulation;https://aarc-west.com/services/industrial-services/;https://aarc-west.com/services/fabrication-services/;https://aarc-west.com/services/heat-tracing-services/;https://aarc-west.com/services/firestopping-services/;https://aarc-west.com/company/about-us/",
+      "confidence": 0.9
+    }
+  },
+  "ChIJAd7xjh15hlQRCdMIvVzYhAo": {
+    "ts": 1770838739.4467456,
+    "value": {
+      "is_competitor": false,
+      "size_bucket": "Small",
+      "employee_estimate": "12 employees",
+      "size_confidence": 0.9,
+      "size_evidence": "Approximately 12 employees at this location.",
+      "service_offerings": {
+        "scaffolding": false,
+        "scaffolding_confidence": 0.0,
+        "scaffolding_evidence": "No scaffolding services listed.",
+        "forming_shoring": false,
+        "forming_shoring_confidence": 0.0,
+        "forming_shoring_evidence": "No forming or shoring services listed.",
+        "insulation": false,
+        "insulation_confidence": 0.0,
+        "insulation_evidence": "No insulation services listed.",
+        "painting": true,
+        "painting_confidence": 0.8,
+        "painting_evidence": "Offers powder coating services.",
+        "motorized": false,
+        "motorized_confidence": 0.0,
+        "motorized_evidence": "No motorized access services listed.",
+        "specialty": true,
+        "specialty_confidence": 0.7,
+        "specialty_evidence": "Provides anodizing, Teflon, ceramic coatings, and sand-blasting."
+      },
+      "summary": "Surf-Tech Industries Ltd specializes in various coating services, including anodizing, powder coating, Teflon and ceramic coatings, and sand-blasting, catering to diverse industrial needs.",
+      "top_sources": [
+        "([allbiz.ca](https://www.allbiz.ca/fr/surf-tech-industries-ltd-604-461-0750?utm_source=openai))",
+        "([mapquest.com](https://www.mapquest.com/ca/british-columbia/surf-tech-industries-ltd-455147024?utm_source=openai))",
+        "([yellowpages.ca](https://www.yellowpages.ca/bus/British-Columbia/Port-Moody/Surf-Tech/6253515.html?utm_source=openai))"
+      ],
+      "citations": "([allbiz.ca](https://www.allbiz.ca/fr/surf-tech-industries-ltd-604-461-0750?utm_source=openai));([mapquest.com](https://www.mapquest.com/ca/british-columbia/surf-tech-industries-ltd-455147024?utm_source=openai));([yellowpages.ca](https://www.yellowpages.ca/bus/British-Columbia/Port-Moody/Surf-Tech/6253515.html?utm_source=openai))",
+      "confidence": 0.9
+    }
+  },
+  "ChIJQ3jx661RXoMRzlOV94LqOrk": {
+    "ts": 1770838739.4467456,
+    "value": {
+      "is_competitor": false,
+      "size_bucket": "Mid",
+      "employee_estimate": "Over 20 employees",
+      "size_confidence": 0.8,
+      "size_evidence": "Over two decades of industry experience and more than five years dedicated to shaping Vancouver’s landscape.",
+      "service_offerings": {
+        "scaffolding": false,
+        "scaffolding_confidence": 0.0,
+        "scaffolding_evidence": "No scaffolding services listed.",
+        "forming_shoring": false,
+        "forming_shoring_confidence": 0.0,
+        "forming_shoring_evidence": "No forming or shoring services listed.",
+        "insulation": false,
+        "insulation_confidence": 0.0,
+        "insulation_evidence": "No insulation services listed.",
+        "painting": false,
+        "painting_confidence": 0.0,
+        "painting_evidence": "No painting services listed.",
+        "motorized": false,
+        "motorized_confidence": 0.0,
+        "motorized_evidence": "No motorized access services listed.",
+        "specialty": true,
+        "specialty_confidence": 0.7,
+        "specialty_evidence": "Specializes in civil construction, including demolition, excavation, hardscape, and landscape construction."
+      },
+      "summary": "Kandovan Construction Ltd specializes in civil construction services, including demolition, excavation, hardscape, and landscape construction, serving the Greater Vancouver area.",
+      "top_sources": [
+        "([kandovanconstruction.ca](https://kandovanconstruction.ca/?utm_source=openai))",
+        "([coquitlamlocal.ca](https://coquitlamlocal.ca/directory/kandovan-construction/?utm_source=openai))",
+        "([kandovanconstruction.ca](https://kandovanconstruction.ca/projects/vancouver-demolition/?utm_source=openai))"
+      ],
+      "citations": "([kandovanconstruction.ca](https://kandovanconstruction.ca/?utm_source=openai));([coquitlamlocal.ca](https://coquitlamlocal.ca/directory/kandovan-construction/?utm_source=openai));([kandovanconstruction.ca](https://kandovanconstruction.ca/projects/vancouver-demolition/?utm_source=openai))",
+      "confidence": 0.8
+    }
+  },
+  "ChIJi5qgIxpxhlQRenVTtnRkxSU": {
+    "ts": 1770838739.4467456,
+    "value": {
+      "is_competitor": true,
+      "size_bucket": "Mid",
+      "employee_estimate": "Over 20 employees",
+      "size_confidence": 0.8,
+      "size_evidence": "18 years of industry experience, offering premium-quality equipment and exceptional service.",
+      "service_offerings": {
+        "scaffolding": true,
+        "scaffolding_confidence": 0.9,
+        "scaffolding_evidence": "Specializes in suspended slab shoring rentals and engineering services.",
+        "forming_shoring": true,
+        "forming_shoring_confidence": 0.9,
+        "forming_shoring_evidence": "Provides aluminum and steel shoring frames, post shores, and formwork equipment.",
+        "insulation": false,
+        "insulation_confidence": 0.0,
+        "insulation_evidence": "No insulation services listed.",
+        "painting": false,
+        "painting_confidence": 0.0,
+        "painting_evidence": "No painting services listed.",
+        "motorized": false,
+        "motorized_confidence": 0.0,
+        "motorized_evidence": "No motorized access services listed.",
+        "specialty": true,
+        "specialty_confidence": 0.7,
+        "specialty_evidence": "Offers engineering support for shoring projects and fast delivery services."
+      },
+      "summary": "TTF Scaffolding Inc. specializes in suspended slab shoring rentals and engineering services, providing high-quality equipment and exceptional customer service in the Greater Vancouver area.",
+      "top_sources": [
+        "([ttfscaffolding.com](https://ttfscaffolding.com/?utm_source=openai))",
+        "([ttfscaffolding.com](https://ttfscaffolding.com/contact/?utm_source=openai))",
+        "([mapquest.com](https://www.mapquest.com/ca/british-columbia/ttf-scaffolding-inc-423652472?utm_source=openai))"
+      ],
+      "citations": "([ttfscaffolding.com](https://ttfscaffolding.com/?utm_source=openai));([ttfscaffolding.com](https://ttfscaffolding.com/contact/?utm_source=openai));([mapquest.com](https://www.mapquest.com/ca/british-columbia/ttf-scaffolding-inc-423652472?utm_source=openai))",
+      "confidence": 0.9
+    }
+  },
+  "ChIJF_Neq_jZhVQRQ8juGUoacD8": {
+    "ts": 1770838739.4467456,
+    "value": {
+      "is_competitor": false,
+      "size_bucket": "Small",
+      "employee_estimate": "8 employees",
+      "size_confidence": 0.8,
+      "size_evidence": "Approximately 8 employees.",
+      "service_offerings": {
+        "scaffolding": false,
+        "scaffolding_confidence": 0.0,
+        "scaffolding_evidence": "No scaffolding services listed.",
+        "forming_shoring": false,
+        "forming_shoring_confidence": 0.0,
+        "forming_shoring_evidence": "No forming or shoring services listed.",
+        "insulation": false,
+        "insulation_confidence": 0.0,
+        "insulation_evidence": "No insulation services listed.",
+        "painting": false,
+        "painting_confidence": 0.0,
+        "painting_evidence": "No painting services listed.",
+        "motorized": false,
+        "motorized_confidence": 0.0,
+        "motorized_evidence": "No motorized access services listed.",
+        "specialty": true,
+        "specialty_confidence": 0.7,
+        "specialty_evidence": "Provides rig welding and mobile dispatch services for industrial, structural, and regulated welding projects."
+      },
+      "summary": "Canadian Pressure Welding Contracting Ltd. offers rig welding and mobile dispatch services for industrial, structural, and regulated welding projects across Vancouver and the Lower Mainland.",
+      "top_sources": [
+        "([ca.linkedin.com](https://ca.linkedin.com/company/cpw-contracting-ltd?utm_source=openai))",
+        "([cpwcontracting.com](https://cpwcontracting.com/about-us/?utm_source=openai))",
+        "([cpwcontracting.com](https://cpwcontracting.com/services/?utm_source=openai))"
+      ],
+      "citations": "([ca.linkedin.com](https://ca.linkedin.com/company/cpw-contracting-ltd?utm_source=openai));([cpwcontracting.com](https://cpwcontracting.com/about-us/?utm_source=openai));([cpwcontracting.com](https://cpwcontracting.com/services/?utm_source=openai))",
+      "confidence": 0.8
+    }
+  },
+  "ChIJb551OPl0hlQRBnKzHgrFpak": {
+    "ts": 1770838739.4467456,
+    "value": {
+      "is_competitor": true,
+      "size_bucket": "Mid",
+      "employee_estimate": "Over 20 employees",
+      "size_confidence": 0.8,
+      "size_evidence": "Offers shotcrete shoring services and deep excavation.",
+      "service_offerings": {
+        "scaffolding": true,
+        "scaffolding_confidence": 0.9,
+        "scaffolding_evidence": "Provides shotcrete shoring services.",
+        "forming_shoring": true,
+        "forming_shoring_confidence": 0.9,
+        "forming_shoring_evidence": "Offers deep excavation services.",
+        "insulation": false,
+        "insulation_confidence": 0.0,
+        "insulation_evidence": "No insulation services listed.",
+        "painting": false,
+        "painting_confidence": 0.0,
+        "painting_evidence": "No painting services listed.",
+        "motorized": false,
+        "motorized_confidence": 0.0,
+        "motorized_evidence": "No motorized access services listed.",
+        "specialty": true,
+        "specialty_confidence": 0.7,
+        "specialty_evidence": "Provides structural shotcrete, civil infrastructure, site preparation, and demolition services."
+      },
+      "summary": "Ironhorse Shoring & Deep Foundations specializes in shotcrete shoring, deep excavation, structural shotcrete, civil infrastructure, site preparation, and demolition services.",
+      "top_sources": [
+        "([ironhorseshoring.com](https://ironhorseshoring.com/?utm_source=openai))"
+      ],
+      "citations": "([ironhorseshoring.com](https://ironhorseshoring.com/?utm_source=openai))",
+      "confidence": 0.9
+    }
+  },
+  "ChIJw9B0ZQx3hlQRGHRPjAhVWnY": {
+    "ts": 1770838742.4168265,
+    "value": {
+      "is_competitor": false,
+      "size_bucket": "Unknown",
+      "employee_estimate": "Not specified",
+      "size_confidence": 0.5,
+      "size_evidence": "Limited information available; no employee count provided.",
+      "service_offerings": {
+        "scaffolding": false,
+        "scaffolding_confidence": 0.0,
+        "scaffolding_evidence": "No scaffolding services mentioned.",
+        "forming_shoring": false,
+        "forming_shoring_confidence": 0.0,
+        "forming_shoring_evidence": "No forming or shoring services mentioned.",
+        "insulation": true,
+        "insulation_confidence": 0.9,
+        "insulation_evidence": "Specializes in R50 blown-in fiberglass insulation.",
+        "painting": false,
+        "painting_confidence": 0.0,
+        "painting_evidence": "No painting services mentioned.",
+        "motorized": false,
+        "motorized_confidence": 0.0,
+        "motorized_evidence": "No motorized access services mentioned.",
+        "specialty": false,
+        "specialty_confidence": 0.0,
+        "specialty_evidence": "No specialty services mentioned."
+      },
+      "summary": "INSULATIONBC.COM specializes in R50 blown-in fiberglass insulation for attics in British Columbia, focusing on energy efficiency and meeting current building codes.",
+      "top_sources": [
+        "([insulationbc.com](https://insulationbc.com/does-blown-in-insulation-settle-over-time/?utm_source=openai))",
+        "([insulationbc.com](https://insulationbc.com/why-r50-insulation-is-the-new-standard-for-bc-attics/?utm_source=openai))"
+      ],
+      "citations": "([insulationbc.com](https://insulationbc.com/does-blown-in-insulation-settle-over-time/?utm_source=openai));([insulationbc.com](https://insulationbc.com/why-r50-insulation-is-the-new-standard-for-bc-attics/?utm_source=openai))",
+      "confidence": 0.9
+    }
+  },
+  "ChIJ55QKavDZhVQRLMNPzEQOwOc": {
+    "ts": 1770838742.4168265,
+    "value": {
+      "is_competitor": false,
+      "size_bucket": "Unknown",
+      "employee_estimate": "Not specified",
+      "size_confidence": 0.5,
+      "size_evidence": "Limited information available; no employee count provided.",
+      "service_offerings": {
+        "scaffolding": false,
+        "scaffolding_confidence": 0.0,
+        "scaffolding_evidence": "No scaffolding services mentioned.",
+        "forming_shoring": false,
+        "forming_shoring_confidence": 0.0,
+        "forming_shoring_evidence": "No forming or shoring services mentioned.",
+        "insulation": true,
+        "insulation_confidence": 0.8,
+        "insulation_evidence": "Company name suggests focus on insulation services.",
+        "painting": false,
+        "painting_confidence": 0.0,
+        "painting_evidence": "No painting services mentioned.",
+        "motorized": false,
+        "motorized_confidence": 0.0,
+        "motorized_evidence": "No motorized access services mentioned.",
+        "specialty": false,
+        "specialty_confidence": 0.0,
+        "specialty_evidence": "No specialty services mentioned."
+      },
+      "summary": "Vivo Insulation Ltd is likely focused on insulation services, as indicated by its name, but specific offerings are not detailed.",
+      "top_sources": [],
+      "citations": "No citations available.",
+      "confidence": 0.8
+    }
+  },
+  "ChIJzxa_UX3XhVQRzpCFgWTzM6A": {
+    "ts": 1770838742.4168265,
+    "value": {
+      "is_competitor": false,
+      "size_bucket": "Unknown",
+      "employee_estimate": "Not specified",
+      "size_confidence": 0.5,
+      "size_evidence": "Limited information available; no employee count provided.",
+      "service_offerings": {
+        "scaffolding": false,
+        "scaffolding_confidence": 0.0,
+        "scaffolding_evidence": "No scaffolding services mentioned.",
+        "forming_shoring": false,
+        "forming_shoring_confidence": 0.0,
+        "forming_shoring_evidence": "No forming or shoring services mentioned.",
+        "insulation": false,
+        "insulation_confidence": 0.0,
+        "insulation_evidence": "No insulation services mentioned.",
+        "painting": false,
+        "painting_confidence": 0.0,
+        "painting_evidence": "No painting services mentioned.",
+        "motorized": false,
+        "motorized_confidence": 0.0,
+        "motorized_evidence": "No motorized access services mentioned.",
+        "specialty": false,
+        "specialty_confidence": 0.0,
+        "specialty_evidence": "No specialty services mentioned."
+      },
+      "summary": "Pacific Sandblasting's website indicates it is 'Launching Soon,' providing no current information on its services.",
+      "top_sources": [
+        ""
+      ],
+      "citations": "",
+      "confidence": 0.0
+    }
+  },
+  "ChIJVWgycZrZhVQRQ4V2JSFQoCg": {
+    "ts": 1770838742.4168265,
+    "value": {
+      "is_competitor": true,
+      "size_bucket": "Mid",
+      "employee_estimate": "50-249",
+      "size_confidence": 0.8,
+      "size_evidence": "Company offers a range of services; employee count likely in this range.",
+      "service_offerings": {
+        "scaffolding": true,
+        "scaffolding_confidence": 0.9,
+        "scaffolding_evidence": "Provides custom scaffold solutions, installation, supply, and rental services.",
+        "forming_shoring": false,
+        "forming_shoring_confidence": 0.0,
+        "forming_shoring_evidence": "No forming or shoring services mentioned.",
+        "insulation": false,
+        "insulation_confidence": 0.0,
+        "insulation_evidence": "No insulation services mentioned.",
+        "painting": true,
+        "painting_confidence": 0.8,
+        "painting_evidence": "Offers professional electrostatic painting services using high-quality coatings.",
+        "motorized": false,
+        "motorized_confidence": 0.0,
+        "motorized_evidence": "No motorized access services mentioned.",
+        "specialty": true,
+        "specialty_confidence": 0.7,
+        "specialty_evidence": "Provides shrink-wrap services for encapsulating structures undergoing renovation."
+      },
+      "summary": "Harris Coating Systems Ltd specializes in electrostatic painting and offers scaffolding and specialty services like shrink-wrap for renovation projects.",
+      "top_sources": [
+        "([harriscoatings.com](https://www.harriscoatings.com/?utm_source=openai))",
+        "([harriscoatings.com](https://harriscoatings.com/company.php?utm_source=openai))"
+      ],
+      "citations": "([harriscoatings.com](https://www.harriscoatings.com/?utm_source=openai));([harriscoatings.com](https://harriscoatings.com/company.php?utm_source=openai))",
+      "confidence": 0.8
+    }
+  },
+  "ChIJcZOnapXFhVQRDK_SWz0HyzU": {
+    "ts": 1770838742.4168265,
+    "value": {
+      "is_competitor": true,
+      "size_bucket": "Mid",
+      "employee_estimate": "50-249",
+      "size_confidence": 0.8,
+      "size_evidence": "Company offers a range of services; employee count likely in this range.",
+      "service_offerings": {
+        "scaffolding": true,
+        "scaffolding_confidence": 0.9,
+        "scaffolding_evidence": "Provides custom scaffold solutions, installation, supply, and rental services.",
+        "forming_shoring": false,
+        "forming_shoring_confidence": 0.0,
+        "forming_shoring_evidence": "No forming or shoring services mentioned.",
+        "insulation": false,
+        "insulation_confidence": 0.0,
+        "insulation_evidence": "No insulation services mentioned.",
+        "painting": false,
+        "painting_confidence": 0.0,
+        "painting_evidence": "No painting services mentioned.",
+        "motorized": false,
+        "motorized_confidence": 0.0,
+        "motorized_evidence": "No motorized access services mentioned.",
+        "specialty": true,
+        "specialty_confidence": 0.7,
+        "specialty_evidence": "Provides shrink-wrap services for encapsulating structures undergoing renovation."
+      },
+      "summary": "Aarc-West Scaffolding offers scaffolding and specialty services like shrink-wrap for renovation projects, with a focus on safety and quality.",
+      "top_sources": [
+        "([awscaffolding.com](https://awscaffolding.com/?utm_source=openai))",
+        "([awscaffolding.com](https://awscaffolding.com/company/about-us/?utm_source=openai))"
+      ],
+      "citations": "([awscaffolding.com](https://awscaffolding.com/?utm_source=openai));([awscaffolding.com](https://awscaffolding.com/company/about-us/?utm_source=openai))",
+      "confidence": 0.8
+    }
+  }
+}
