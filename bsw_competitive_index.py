@@ -1,4 +1,4 @@
-"""brand_competitor_counts_v5.py
+"""bsw_competitive_index.py
 
 BrandSafway Competitor Mapping (Client-Ready)
 ============================================
@@ -34,7 +34,7 @@ Required Environment Variables
 
 Usage
 -----
-  python brand_competitor_counts_v5.py --branches branches.csv
+  python bsw_competitive_index.py --branches branches.csv
 
 branches.csv must contain columns:
   - branch_name
@@ -49,7 +49,7 @@ Outputs (in --output_dir)
 Notes
 -----
 - Google Places cannot guarantee returning *every* business in a radius; this
-  script uses a tuned set of keyword searches + nearby type search to maximize
+  script uses a tuned set of keyword text searches (with pagination) to maximize
   recall for likely competitors.
 - To control cost, consider setting --max_candidates_per_branch and/or a cheaper
   model (default is gpt-4o-mini).
@@ -64,9 +64,10 @@ import math
 import os
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 import pandas as pd
 import requests
@@ -76,11 +77,13 @@ import openai  # type: ignore
 
 # ---------------------------- Defaults ---------------------------- #
 
-DEFAULT_RADIUS_MILES = 30.0
 METERS_PER_MILE = 1609.34
 
+# Places API (New) endpoints and text-search pagination
 PLACES_TEXT_URL = "https://places.googleapis.com/v1/places:searchText"
 PLACES_NEARBY_URL = "https://places.googleapis.com/v1/places:searchNearby"
+MAX_TEXT_SEARCH_PAGES = 3  # Cap pagination per query to control latency/cost
+TEXT_SEARCH_PAGE_DELAY_SECONDS = 1.5  # Brief delay before next page (API token validity)
 
 # Include editorialSummary if you decide to expand signals later.
 PLACES_FIELDS = (
@@ -171,7 +174,6 @@ BLOCK_TYPES = {
     "flooring",
     "moving_company",
     "landscaping",
-    "real_estate_agency",
 }
 
 EXCLUDE_NAME_SUBSTRINGS = {
@@ -278,11 +280,13 @@ class Branch:
     branch_name: str
     latitude: float
     longitude: float
+    region: str = ""
 
 
 @dataclass
 class PlaceCandidate:
     branch_name: str
+    region: str
     branch_latitude: float
     branch_longitude: float
 
@@ -304,7 +308,7 @@ class PlaceCandidate:
 
 
 class JsonCache:
-    """Simple persistent JSON cache with optional TTL."""
+    """Enrichment cache keyed by place_id, with optional TTL. Persists OpenAI enrichment across runs to avoid re-calling the API for the same place."""
 
     def __init__(self, path: Path, ttl_days: Optional[int] = None):
         self._path = path
@@ -402,7 +406,8 @@ class PlacesClient:
 
     def search_text(self, lat: float, lon: float, query: str) -> List[Dict[str, Any]]:
         # searchText only supports locationBias with circle (not locationRestriction.circle).
-        body = {
+        # Paginate with nextPageToken (cap at MAX_TEXT_SEARCH_PAGES) and de-dupe by place_id.
+        body: Dict[str, Any] = {
             "textQuery": query,
             "locationBias": {
                 "circle": {
@@ -411,9 +416,24 @@ class PlacesClient:
                 }
             },
         }
-        return self._post(PLACES_TEXT_URL, body).get("places", [])
+        seen_ids: set = set()
+        all_places: List[Dict[str, Any]] = []
+        for _ in range(MAX_TEXT_SEARCH_PAGES):
+            resp = self._post(PLACES_TEXT_URL, body)
+            for p in resp.get("places", []):
+                pid = p.get("id")
+                if pid and pid not in seen_ids:
+                    seen_ids.add(pid)
+                    all_places.append(p)
+            next_token = resp.get("nextPageToken")
+            if not next_token:
+                break
+            time.sleep(TEXT_SEARCH_PAGE_DELAY_SECONDS)
+            body = {**body, "pageToken": next_token}
+        return all_places
 
     def search_nearby(self, lat: float, lon: float, included_types: List[str]) -> List[Dict[str, Any]]:
+        """Nearby type search. Kept for possible future use; discovery currently uses text search only."""
         body = {
             "includedTypes": included_types,
             "locationRestriction": {
@@ -818,16 +838,13 @@ def is_blocked(place: Dict[str, Any]) -> bool:
 # - Cheap: pure string/type heuristics (no external calls).
 # - Company-name cache: reuse prefilter outcome by normalized company name across runs.
 
-DEFAULT_PREFILTER_MIN_SCORE = 2
-
-
 def normalize_company_name(company_name: str) -> str:
     """Normalize company name for cache key: lowercased, stripped, single spaces."""
     return " ".join((company_name or "").strip().lower().split())
 
 
 class PrefilterCache:
-    """Persistent cache of prefilter results keyed by normalized company name."""
+    """Persistent cache of prefilter results keyed by normalized company name. Separate from enrichment cache because the key is company name, not place_id, and the value is prefilter score/reasons only."""
 
     def __init__(self, path: Path):
         self._path = path
@@ -1108,6 +1125,7 @@ def place_to_candidate(branch: Branch, place: Dict[str, Any], radius_miles: floa
 
     return PlaceCandidate(
         branch_name=branch.branch_name,
+        region=getattr(branch, "region", "") or "",
         branch_latitude=branch.latitude,
         branch_longitude=branch.longitude,
         place_id=place_id,
@@ -1144,18 +1162,6 @@ def discover_branch_candidates(
                     discovered[pid] = p
         except Exception as e:
             logging.warning("Branch %s keyword '%s' search failed: %s", branch.branch_name, kw, e)
-
-    # 2) Nearby type search (broad net; can be noisy but helpful).
-    # Must use Table A types only (see Places API place-types). equipment_rental_agency /
-    # general_contractor are not in Table A for searchNearby.
-    try:
-        nearby_types = ["hardware_store", "home_improvement_store"]
-        for p in places.search_nearby(branch.latitude, branch.longitude, nearby_types):
-            pid = p.get("id")
-            if pid and pid not in discovered:
-                discovered[pid] = p
-    except Exception as e:
-        logging.warning("Branch %s nearby search failed: %s", branch.branch_name, e)
 
     candidates: List[PlaceCandidate] = []
     for p in discovered.values():
@@ -1249,6 +1255,12 @@ def build_branch_summary(df: pd.DataFrame) -> pd.DataFrame:
             median_distance_miles=("distance_miles", "median"),
         )
     )
+    # Add region as second column if present in input
+    if "region" in dfc.columns:
+        region_df = dfc[["branch_name", "region"]].drop_duplicates("branch_name")
+        base = base.merge(region_df, on="branch_name", how="left")
+        cols = ["branch_name", "region"] + [c for c in base.columns if c not in ("branch_name", "region")]
+        base = base[cols]
 
     # Size bucket counts
     if "size_bucket" in dfc.columns:
@@ -1299,10 +1311,10 @@ def build_branch_summary(df: pd.DataFrame) -> pd.DataFrame:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Map BrandSafway competitors around branch locations")
-    p.add_argument("--branches", required=True, help="CSV with branch_name, latitude, longitude")
+    p.add_argument("--branches", required=True, help="Branch input: .xlsx (branch_name, latitude, longitude, region) or .csv (branch_name, latitude, longitude; optional region)")
     p.add_argument("--output_dir", default="out", help="Directory for output CSVs")
 
-    p.add_argument("--radius_miles", type=float, default=DEFAULT_RADIUS_MILES)
+    p.add_argument("--radius_miles", type=float, default=30.0)
     p.add_argument("--keywords", default="", help="Optional semicolon-separated keyword overrides")
 
     # Cost/speed controls
@@ -1310,7 +1322,7 @@ def parse_args() -> argparse.Namespace:
 
     # Prefilter (cost-control). Disable to maximize recall at higher cost.
     p.add_argument("--disable_prefilter", action="store_true", help="Disable heuristic prefilter (higher cost, potentially higher recall)")
-    p.add_argument("--prefilter_min_score", type=int, default=DEFAULT_PREFILTER_MIN_SCORE, help="Minimum prefilter score to run OpenAI enrichment when not cached")
+    p.add_argument("--prefilter_min_score", type=int, default=0, help="Minimum prefilter score to run OpenAI enrichment when not cached")
     p.add_argument("--prefilter_cache_path", default="prefilter_cache.json", help="Path to persistent prefilter cache (keyed by normalized company name)")
 
     # Concurrency controls
@@ -1335,19 +1347,26 @@ def parse_args() -> argparse.Namespace:
 
 
 def load_branches(path: Path) -> List[Branch]:
-    df = pd.read_csv(path)
-    required = {"branch_name", "latitude", "longitude"}
+    suffix = path.suffix.lower()
+    if suffix in (".xlsx", ".xls"):
+        df = pd.read_excel(path, engine="openpyxl")
+        required = {"branch_name", "latitude", "longitude", "region"}
+    else:
+        df = pd.read_csv(path)
+        required = {"branch_name", "latitude", "longitude"}
     missing = required - set(df.columns)
     if missing:
         raise ValueError(f"branches file missing columns: {sorted(missing)}")
 
     branches: List[Branch] = []
     for _, row in df.iterrows():
+        region = str(row.get("region", "")).strip() if "region" in df.columns else ""
         branches.append(
             Branch(
                 branch_name=str(row["branch_name"]),
                 latitude=float(row["latitude"]),
                 longitude=float(row["longitude"]),
+                region=region,
             )
         )
     return branches
@@ -1396,7 +1415,6 @@ def main() -> None:
     logging.info("Loaded %s branches", len(branches))
 
     # ------------------ Phase 1: Discover candidates (parallel per branch) ------------------ #
-    from concurrent.futures import ThreadPoolExecutor, as_completed
 
     all_candidates: List[PlaceCandidate] = []
 
@@ -1448,13 +1466,13 @@ def main() -> None:
 
     # Prefilter gate (cost control): only run OpenAI enrichment on places with
     # sufficient signal, unless already enrichment-cached. Uses company-name cache.
-    prefilter_cache = PrefilterCache(Path(getattr(args, "prefilter_cache_path", "prefilter_cache.json")))
+    prefilter_cache = PrefilterCache(Path(args.prefilter_cache_path))
     prefilter_meta: Dict[str, Dict[str, Any]] = {}
-    prefilter_skipped: set = set()
+    prefilter_skipped: Set[str] = set()
     enrich_pool: List[Dict[str, Any]] = []
 
-    min_score = int(getattr(args, "prefilter_min_score", DEFAULT_PREFILTER_MIN_SCORE))
-    prefilter_enabled = not bool(getattr(args, "disable_prefilter", False))
+    min_score = int(args.prefilter_min_score)
+    prefilter_enabled = not args.disable_prefilter
 
     for p in place_list:
         pid = p["place_id"]
@@ -1522,7 +1540,10 @@ def main() -> None:
         # Save cache after enrichment
         cache.save()
 
-    # Pull cached values for everything (including hits and post-enrichment)
+    # Track place_ids that got hard fallback (no cache, not prefilter skip) for ai_enriched column.
+    hard_fallback_ids: Set[str] = set()
+
+    # Fill enriched_by_place_id for all places (cache hits, prefilter skip fallback, hard fallback).
     for p in place_list:
         pid = p["place_id"]
         cached = enricher.get_cached(pid)
@@ -1539,6 +1560,7 @@ def main() -> None:
             continue
 
         # Hard fallback (e.g., enrichment failure)
+        hard_fallback_ids.add(pid)
         enriched_by_place_id[pid] = {
             "is_competitor": False,
             "size_bucket": "Unknown",
@@ -1559,6 +1581,7 @@ def main() -> None:
         enrichment = enriched_by_place_id.get(c.place_id, {})
         row = {
             "branch_name": c.branch_name,
+            "region": getattr(c, "region", "") or "",
             "branch_latitude": c.branch_latitude,
             "branch_longitude": c.branch_longitude,
             "place_id": c.place_id,
@@ -1575,13 +1598,15 @@ def main() -> None:
         }
         row.update(prefilter_meta.get(c.place_id, {}))
         row.update(flatten_enrichment(enrichment))
+        # True when enrichment came from OpenAI or cache (originally from AI); False for prefilter or hard fallback.
+        row["ai_enriched"] = c.place_id not in prefilter_skipped and c.place_id not in hard_fallback_ids
         rows.append(row)
 
     df_out = pd.DataFrame(rows)
 
     # Optional: keep only competitor rows in the main output? We'll keep all, but users can filter.
-    out_path = output_dir / "competitors_enriched.csv"
-    df_out.to_csv(out_path, index=False)
+    out_path = output_dir / "competitors_enriched.xlsx"
+    df_out.to_excel(out_path, index=False, engine="openpyxl")
     logging.info("Wrote: %s", out_path)
 
     # Branch-level summary
