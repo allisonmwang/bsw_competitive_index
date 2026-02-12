@@ -1600,6 +1600,7 @@ def main() -> None:
         row.update(flatten_enrichment(enrichment))
         # True when enrichment came from OpenAI or cache (originally from AI); False for prefilter or hard fallback.
         row["ai_enriched"] = c.place_id not in prefilter_skipped and c.place_id not in hard_fallback_ids
+        row["point_type"] = "competitor"
         rows.append(row)
 
     df_out = pd.DataFrame(rows)
